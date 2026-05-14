@@ -1,0 +1,175 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>HaxFútbol — Multijugador Online</title>
+  <meta name="description" content="Juego de fútbol multijugador estilo Haxball. Crea salas, invita amigos y juega en tiempo real.">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+  <!-- ═══ SCREEN: NICKNAME ═══ -->
+  <div id="screen-nickname" class="screen active">
+    <div class="center-container">
+      <div class="logo-box">
+        <div class="logo-icon">⚽</div>
+        <h1 class="logo-title">Hax<span class="accent">Fútbol</span></h1>
+        <p class="logo-sub">Multijugador en tiempo real</p>
+      </div>
+      <div class="card glass">
+        <label for="input-nickname">Tu apodo</label>
+        <input type="text" id="input-nickname" maxlength="16" placeholder="Ej: Messi_10" autocomplete="off" autofocus>
+        <button id="btn-enter" class="btn-primary">ENTRAR</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ═══ SCREEN: LOBBY ═══ -->
+  <div id="screen-lobby" class="screen">
+    <div class="lobby-container">
+      <header class="lobby-header">
+        <div class="lobby-title">
+          <span class="logo-icon-sm">⚽</span>
+          <h2>Hax<span class="accent">Fútbol</span></h2>
+        </div>
+        <div class="lobby-user">
+          <span id="display-nickname" class="nickname-badge"></span>
+        </div>
+      </header>
+
+      <div class="lobby-body">
+        <!-- CREATE ROOM -->
+        <div class="card glass lobby-create">
+          <h3>Crear Sala</h3>
+          <div class="form-row">
+            <div class="form-group">
+              <label for="create-name">Nombre de sala</label>
+              <input type="text" id="create-name" maxlength="30" placeholder="Mi Sala Pro">
+            </div>
+            <div class="form-group">
+              <label for="create-password">Contraseña <span class="optional">(opcional)</span></label>
+              <input type="password" id="create-password" maxlength="20" placeholder="••••">
+            </div>
+            <div class="form-group small">
+              <label for="create-max">Máx.</label>
+              <input type="number" id="create-max" min="2" max="20" value="10">
+            </div>
+          </div>
+          <button id="btn-create-room" class="btn-primary">CREAR SALA</button>
+        </div>
+
+        <!-- ROOM LIST -->
+        <div class="card glass lobby-rooms">
+          <div class="rooms-header">
+            <h3>Salas disponibles</h3>
+            <button id="btn-refresh" class="btn-icon" title="Refrescar">↻</button>
+          </div>
+          <div id="room-list" class="room-list">
+            <p class="room-empty">Buscando salas...</p>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ═══ SCREEN: GAME ROOM ═══ -->
+  <div id="screen-game" class="screen">
+    <!-- TOP BAR -->
+    <div class="game-topbar">
+      <button id="btn-leave" class="btn-small btn-danger">✕ SALIR</button>
+      <div class="room-info">
+        <span id="room-name-display" class="room-name-tag"></span>
+      </div>
+      <div class="score-display">
+        <span class="score-red" id="score-red">0</span>
+        <span class="score-separator">-</span>
+        <span class="score-blue" id="score-blue">0</span>
+      </div>
+      <div id="timer-display" class="timer-display">0:00</div>
+    </div>
+
+    <!-- GAME AREA -->
+    <div class="game-area">
+      <!-- SIDEBAR LEFT: Teams -->
+      <div class="sidebar sidebar-left">
+        <div class="team-panel" id="panel-red">
+          <h4 class="team-title team-red-title">🔴 ROJO</h4>
+          <div id="team-red-list" class="team-list"></div>
+          <button class="btn-team btn-join-red" data-team="red">Unirse</button>
+        </div>
+        <div class="team-panel" id="panel-spectator">
+          <h4 class="team-title team-spec-title">👁 ESPECTADOR</h4>
+          <div id="team-spec-list" class="team-list"></div>
+          <button class="btn-team btn-join-spec" data-team="spectator">Observar</button>
+        </div>
+        <div class="team-panel" id="panel-blue">
+          <h4 class="team-title team-blue-title">🔵 AZUL</h4>
+          <div id="team-blue-list" class="team-list"></div>
+          <button class="btn-team btn-join-blue" data-team="blue">Unirse</button>
+        </div>
+      </div>
+
+      <!-- CANVAS -->
+      <div class="canvas-wrapper" id="canvas-wrapper">
+        <canvas id="game-canvas"></canvas>
+        <div id="game-overlay" class="game-overlay">
+          <div id="overlay-content" class="overlay-content">
+            <p>Esperando inicio...</p>
+          </div>
+        </div>
+        <!-- Goal animation -->
+        <div id="goal-banner" class="goal-banner hidden">
+          <span class="goal-text">⚽ ¡GOOOL!</span>
+          <span id="goal-scorer" class="goal-scorer"></span>
+        </div>
+      </div>
+
+      <!-- SIDEBAR RIGHT: Chat & Controls -->
+      <div class="sidebar sidebar-right">
+        <div class="host-controls" id="host-controls" style="display:none;">
+          <h4>⚙ Controles Host</h4>
+          <div class="settings-row">
+            <label>Goles para ganar</label>
+            <input type="number" id="setting-max-score" min="1" max="20" value="5">
+          </div>
+          <div class="settings-row">
+            <label>Tiempo (seg, 0=∞)</label>
+            <input type="number" id="setting-time-limit" min="0" max="600" value="180">
+          </div>
+          <button id="btn-start-game" class="btn-primary btn-start">▶ INICIAR</button>
+          <button id="btn-stop-game" class="btn-small btn-danger" style="display:none;">⏹ DETENER</button>
+          <button id="btn-save-settings" class="btn-small btn-secondary">💾 Guardar Config</button>
+        </div>
+
+        <div class="chat-panel">
+          <h4>💬 Chat</h4>
+          <div id="chat-log" class="chat-log"></div>
+          <div class="chat-input-row">
+            <input type="text" id="chat-input" maxlength="200" placeholder="Escribe un mensaje...">
+            <button id="btn-send-chat" class="btn-icon">➤</button>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- PASSWORD MODAL -->
+  <div id="modal-password" class="modal hidden">
+    <div class="modal-backdrop"></div>
+    <div class="modal-box glass">
+      <h3>🔒 Sala protegida</h3>
+      <input type="password" id="modal-password-input" placeholder="Contraseña">
+      <div class="modal-buttons">
+        <button id="modal-cancel" class="btn-small btn-secondary">Cancelar</button>
+        <button id="modal-join" class="btn-small btn-primary">Unirse</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="/socket.io/socket.io.js"></script>
+  <script src="game.js"></script>
+</body>
+</html>
