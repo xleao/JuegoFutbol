@@ -21,24 +21,38 @@ const els = {
 };
 
 let myNickname = '', myId = null, isHost = false, currentRoomId = null, gameRunning = false, pendingJoinRoomId = null;
+const playerCache = new Map();
+const particles = [];
+const ballHistory = [];
+let shakeAmount = 0;
+let lastBallVx = 0;
+let lastBallVy = 0;
 const FIELD_W = 1200, FIELD_H = 600, GOAL_SIZE = 160, WALL_THICKNESS = 6, GOAL_DEPTH = 40;
 
 // Physics constants (must match server)
-const PLAYER_SPEED = 1.4, FRICTION_PLAYER = 0.84, FRICTION_BALL = 0.99;
+const PLAYER_SPEED = 0.35, FRICTION_PLAYER = 0.94, FRICTION_BALL = 0.985;
 
 const keys = { up: false, down: false, left: false, right: false, kick: false };
-let lastSentInput = '';
+const inputHistory = [];
+
+let clientInputSeq = 0;
+let visualOffset = { x: 0, y: 0 };
+const snapshotQueue = [];
+const RENDER_DELAY = 85;
 
 // ─── LOCAL PREDICTION for own player ─────────────────────────
 let localPlayer = { x: 0, y: 0, vx: 0, vy: 0, radius: 18 };
+let localPlayerPrev = { x: 0, y: 0 };
 let localPlayerActive = false;
 
-// ─── INTERPOLATION for remote entities ───────────────────────
-let prevSnapshot = null, curSnapshot = null, snapshotTime = 0;
-const SNAPSHOT_INTERVAL = 1000 / 20;
+// ─── SMOOTH RENDERING FOR ENTITIES ───────────────────────────
+const targetPlayers = new Map(); // player.id -> {x, y, team, radius, ping}
+let targetBall = { x: FIELD_W / 2, y: FIELD_H / 2 };
 let renderPlayers = [];
 let renderBall = { x: FIELD_W / 2, y: FIELD_H / 2, radius: 12 };
 let lastFrameTime = 0;
+let physicsAccumulator = 0;
+let hasReceivedFirstState = false;
 
 // ─── CANVAS ──────────────────────────────────────────────────
 const ctx = els.canvas.getContext('2d');
@@ -55,15 +69,15 @@ function resizeCanvas() {
 }
 window.addEventListener('resize', resizeCanvas);
 
-// ─── LOCAL PLAYER PHYSICS (runs every frame at 60fps) ────────
-function updateLocalPlayer(dt) {
+// ─── LOCAL PLAYER PHYSICS (runs at 60Hz fixed timestep) ──────
+function updateLocalPlayer(inputKeys = keys) {
   if (!localPlayerActive) return;
 
   let ax = 0, ay = 0;
-  if (keys.up) ay -= PLAYER_SPEED;
-  if (keys.down) ay += PLAYER_SPEED;
-  if (keys.left) ax -= PLAYER_SPEED;
-  if (keys.right) ax += PLAYER_SPEED;
+  if (inputKeys.up) ay -= PLAYER_SPEED;
+  if (inputKeys.down) ay += PLAYER_SPEED;
+  if (inputKeys.left) ax -= PLAYER_SPEED;
+  if (inputKeys.right) ax += PLAYER_SPEED;
   if (ax !== 0 && ay !== 0) { ax *= 0.707; ay *= 0.707; }
 
   localPlayer.vx += ax;
@@ -84,91 +98,316 @@ function updateLocalPlayer(dt) {
 }
 
 // Gently correct local player position towards server truth
-function correctLocalPlayer(serverX, serverY) {
-  if (!localPlayerActive) {
-    localPlayer.x = serverX;
-    localPlayer.y = serverY;
-    return;
-  }
-  const correctionStrength = 0.15; // Blend 15% towards server each snapshot
-  localPlayer.x += (serverX - localPlayer.x) * correctionStrength;
-  localPlayer.y += (serverY - localPlayer.y) * correctionStrength;
-}
-
 // ─── INTERPOLATION ───────────────────────────────────────────
 function lerp(a, b, t) { return a + (b - a) * t; }
 
-function interpolateRemotes(now) {
-  if (!curSnapshot) return;
-  if (!prevSnapshot) prevSnapshot = curSnapshot;
+// ─── VFX PARTICLE SYSTEM & TRAILS ────────────────────────────
+function spawnParticles(x, y, color, count, speed, sizeRange, decayRange, gravity = 0) {
+  for (let i = 0; i < count; i++) {
+    const angle = Math.random() * Math.PI * 2;
+    const velocity = (0.3 + Math.random() * 0.7) * speed;
+    particles.push({
+      x,
+      y,
+      vx: Math.cos(angle) * velocity,
+      vy: Math.sin(angle) * velocity,
+      color,
+      size: sizeRange[0] + Math.random() * (sizeRange[1] - sizeRange[0]),
+      alpha: 1,
+      decay: decayRange[0] + Math.random() * (decayRange[1] - decayRange[0]),
+      gravity
+    });
+  }
+}
 
-  const elapsed = now - snapshotTime;
-  let t = Math.min(elapsed / SNAPSHOT_INTERVAL, 1.5);
-
-  // Ball interpolation
-  const cb = curSnapshot.ball, pb = prevSnapshot.ball;
-  if (cb && pb) {
-    if (t <= 1) {
-      renderBall.x = lerp(pb.x, cb.x, t);
-      renderBall.y = lerp(pb.y, cb.y, t);
-    } else {
-      const extra = (t - 1) * SNAPSHOT_INTERVAL / 16.67;
-      renderBall.x = cb.x + (cb.vx || 0) * extra * FRICTION_BALL;
-      renderBall.y = cb.y + (cb.vy || 0) * extra * FRICTION_BALL;
+function updateAndDrawParticles() {
+  for (let i = particles.length - 1; i >= 0; i--) {
+    const p = particles[i];
+    p.x += p.vx;
+    p.y += p.vy;
+    p.vy += p.gravity;
+    p.alpha -= p.decay;
+    if (p.alpha <= 0) {
+      particles.splice(i, 1);
+      continue;
     }
-    renderBall.radius = cb.radius;
+    ctx.save();
+    ctx.globalAlpha = p.alpha;
+    ctx.fillStyle = p.color;
+    ctx.beginPath();
+    ctx.arc(p.x, p.y, p.size, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.restore();
+  }
+}
+
+function updateBallTrail() {
+  if (!renderBall) return;
+  ballHistory.push({ x: renderBall.x, y: renderBall.y });
+  if (ballHistory.length > 8) {
+    ballHistory.shift();
+  }
+}
+
+function drawBallTrail() {
+  const speedSq = renderBall.vx * renderBall.vx + renderBall.vy * renderBall.vy;
+  const speed = Math.sqrt(speedSq || 0);
+  if (speed < 1.2) return;
+  
+  for (let i = 0; i < ballHistory.length; i++) {
+    const pos = ballHistory[i];
+    const alpha = (i + 1) / ballHistory.length * 0.18;
+    const radius = renderBall.radius * (0.4 + 0.6 * (i + 1) / ballHistory.length);
+    ctx.beginPath();
+    ctx.arc(pos.x, pos.y, radius, 0, Math.PI * 2);
+    ctx.fillStyle = `rgba(255, 255, 255, ${alpha})`;
+    ctx.fill();
+  }
+}
+
+function updateRenderPositions(dt) {
+  if (!hasReceivedFirstState) return;
+
+  // Visual error offset decay for local player
+  visualOffset.x *= 0.85;
+  visualOffset.y *= 0.85;
+  if (Math.abs(visualOffset.x) < 0.01) visualOffset.x = 0;
+  if (Math.abs(visualOffset.y) < 0.01) visualOffset.y = 0;
+
+  // If there are not enough snapshots, fallback to direct positioning
+  if (snapshotQueue.length < 2) {
+    if (renderBall) {
+      renderBall.x = targetBall.x;
+      renderBall.y = targetBall.y;
+    }
+    const newRenderPlayers = [];
+    targetPlayers.forEach((target, id) => {
+      let rx = target.x;
+      let ry = target.y;
+      if (id === myId) {
+        const alpha = physicsAccumulator / 16.67;
+        rx = lerp(localPlayerPrev.x, localPlayer.x, alpha) + visualOffset.x;
+        ry = lerp(localPlayerPrev.y, localPlayer.y, alpha) + visualOffset.y;
+      }
+      newRenderPlayers.push({
+        id,
+        team: target.team,
+        radius: target.radius,
+        ping: target.ping,
+        x: rx,
+        y: ry
+      });
+    });
+    renderPlayers = newRenderPlayers;
+    return;
   }
 
-  // Build render list: interpolate remote players, use local for self
-  renderPlayers = curSnapshot.players.map(cp => {
-    // Local player: use predicted position
-    if (cp.id === myId) {
-      return { ...cp, x: localPlayer.x, y: localPlayer.y };
+  // Calculate the time at which we want to render the remote entities
+  const renderTime = performance.now() - RENDER_DELAY;
+
+  // Find two snapshots (s0 and s1) that bracket the renderTime
+  let s0 = null;
+  let s1 = null;
+
+  for (let i = 0; i < snapshotQueue.length - 1; i++) {
+    const snapA = snapshotQueue[i];
+    const snapB = snapshotQueue[i + 1];
+    if (renderTime >= snapA.time && renderTime <= snapB.time) {
+      s0 = snapA;
+      s1 = snapB;
+      break;
     }
+  }
 
-    // Remote players: smooth interpolation
-    const pp = prevSnapshot.players.find(p => p.id === cp.id);
-    if (!pp) return { ...cp };
-
-    let x, y;
-    if (t <= 1) {
-      x = lerp(pp.x, cp.x, t);
-      y = lerp(pp.y, cp.y, t);
+  // Handle boundary conditions if renderTime falls outside our queue range
+  if (!s0) {
+    if (renderTime < snapshotQueue[0].time) {
+      s0 = snapshotQueue[0];
+      s1 = snapshotQueue[0];
     } else {
-      const extra = (t - 1) * SNAPSHOT_INTERVAL / 16.67;
-      x = cp.x + (cp.vx || 0) * extra * FRICTION_PLAYER;
-      y = cp.y + (cp.vy || 0) * extra * FRICTION_PLAYER;
+      s0 = snapshotQueue[snapshotQueue.length - 1];
+      s1 = snapshotQueue[snapshotQueue.length - 1];
     }
-    return { ...cp, x, y };
+  }
+
+  // Calculate interpolation factor
+  const t = s0 === s1 ? 0 : (renderTime - s0.time) / (s1.time - s0.time);
+
+  // 1. Interpolate Ball
+  renderBall.x = lerp(s0.state.ball.x, s1.state.ball.x, t);
+  renderBall.y = lerp(s0.state.ball.y, s1.state.ball.y, t);
+  renderBall.vx = lerp(s0.state.ball.vx || 0, s1.state.ball.vx || 0, t);
+  renderBall.vy = lerp(s0.state.ball.vy || 0, s1.state.ball.vy || 0, t);
+  renderBall.radius = s0.state.ball.radius || 12;
+
+  // 2. Interpolate Players (local uses prediction, remotes use snapshot interpolation)
+  const newRenderPlayers = [];
+  
+  // Find all remote player IDs from the two snapshots
+  const playerIds = new Set();
+  s0.state.players.forEach(p => { if (p.id !== myId) playerIds.add(p.id); });
+  s1.state.players.forEach(p => { if (p.id !== myId) playerIds.add(p.id); });
+
+  // Add the local player first (using client prediction + visual offset)
+  const localTarget = targetPlayers.get(myId);
+  if (localTarget) {
+    const alpha = physicsAccumulator / 16.67;
+    const rx = lerp(localPlayerPrev.x, localPlayer.x, alpha) + visualOffset.x;
+    const ry = lerp(localPlayerPrev.y, localPlayer.y, alpha) + visualOffset.y;
+    newRenderPlayers.push({
+      id: myId,
+      team: localTarget.team,
+      radius: localTarget.radius,
+      ping: localTarget.ping,
+      x: rx,
+      y: ry
+    });
+  }
+
+  // Add the interpolated remote players
+  playerIds.forEach(id => {
+    const p0 = s0.state.players.find(p => p.id === id);
+    const p1 = s1.state.players.find(p => p.id === id);
+
+    if (p0 && p1) {
+      newRenderPlayers.push({
+        id,
+        team: p0.team,
+        radius: p0.radius,
+        ping: p0.ping || 0,
+        x: lerp(p0.x, p1.x, t),
+        y: lerp(p0.y, p1.y, t)
+      });
+    } else if (p0) {
+      newRenderPlayers.push({
+        id,
+        team: p0.team,
+        radius: p0.radius,
+        ping: p0.ping || 0,
+        x: p0.x,
+        y: p0.y
+      });
+    } else if (p1) {
+      newRenderPlayers.push({
+        id,
+        team: p1.team,
+        radius: p1.radius,
+        ping: p1.ping || 0,
+        x: p1.x,
+        y: p1.y
+      });
+    }
   });
+
+  renderPlayers = newRenderPlayers;
 }
 
 // ─── RENDER LOOP ─────────────────────────────────────────────
 function render(timestamp) {
   requestAnimationFrame(render);
-  if (!curSnapshot) return;
+  if (!hasReceivedFirstState) return;
 
+  if (!lastFrameTime) lastFrameTime = timestamp;
   const dt = timestamp - lastFrameTime;
   lastFrameTime = timestamp;
 
-  // Run local prediction every frame
-  updateLocalPlayer(dt);
+  // Run local prediction with fixed timestep (60Hz / 16.67ms)
+  if (localPlayerActive) {
+    physicsAccumulator += dt;
+    if (physicsAccumulator > 100) physicsAccumulator = 100; // Prevent death spiral on lag spikes
+    while (physicsAccumulator >= 16.67) {
+      localPlayerPrev.x = localPlayer.x;
+      localPlayerPrev.y = localPlayer.y;
 
-  // Interpolate remote entities
-  interpolateRemotes(performance.now());
+      clientInputSeq++;
+      inputHistory.push({
+        seq: clientInputSeq,
+        keys: { ...keys }
+      });
+      if (inputHistory.length > 300) inputHistory.shift();
+
+      updateLocalPlayer(keys);
+
+      if (gameRunning && localPlayerActive) {
+        socket.emit('playerInput', { keys, seq: clientInputSeq });
+      }
+
+      physicsAccumulator -= 16.67;
+    }
+  }
+
+  // Smoothly follow remote entities
+  updateRenderPositions(dt);
+  
+  // Update ball trail history
+  updateBallTrail();
 
   const s = canvasScale;
   ctx.clearRect(0, 0, els.canvas.width, els.canvas.height);
   ctx.save();
+  
+  // Apply Screen Shake
+  if (shakeAmount > 0.05) {
+    const dx = (Math.random() - 0.5) * shakeAmount;
+    const dy = (Math.random() - 0.5) * shakeAmount;
+    ctx.translate(dx * s, dy * s);
+    shakeAmount *= 0.88; // decay
+  } else {
+    shakeAmount = 0;
+  }
+  
   ctx.translate(canvasOffX, canvasOffY);
   ctx.scale(s, s);
+  
   drawField();
+  
+  // Draw ball trail BEFORE the ball itself
+  drawBallTrail();
+  
   drawBall(renderBall);
   drawPlayers(renderPlayers);
+  
+  // Update and draw particles
+  updateAndDrawParticles();
+  
   ctx.restore();
 }
 
 // ─── DRAWING ─────────────────────────────────────────────────
+function drawGoalNet(x, y, w, h, isLeft) {
+  ctx.save();
+  ctx.fillStyle = isLeft ? 'rgba(239, 68, 68, 0.08)' : 'rgba(59, 130, 246, 0.08)';
+  ctx.fillRect(x, y, w, h);
+  
+  ctx.strokeStyle = isLeft ? 'rgba(239, 68, 68, 0.5)' : 'rgba(59, 130, 246, 0.5)';
+  ctx.lineWidth = 2.5;
+  ctx.strokeRect(x, y, w, h);
+  
+  ctx.strokeStyle = 'rgba(255, 255, 255, 0.15)';
+  ctx.lineWidth = 1;
+  const spacing = 12;
+  
+  for (let ny = y + spacing; ny < y + h; ny += spacing) {
+    ctx.beginPath(); ctx.moveTo(x, ny); ctx.lineTo(x + w, ny); ctx.stroke();
+  }
+  for (let nx = x + spacing; nx < x + w; nx += spacing) {
+    ctx.beginPath(); ctx.moveTo(nx, y); ctx.lineTo(nx, y + h); ctx.stroke();
+  }
+  
+  ctx.strokeStyle = isLeft ? 'rgba(239, 68, 68, 0.3)' : 'rgba(59, 130, 246, 0.3)';
+  ctx.lineWidth = 1.5;
+  ctx.beginPath();
+  if (isLeft) {
+    ctx.moveTo(x, y); ctx.lineTo(x + w, y + h / 2);
+    ctx.moveTo(x, y + h); ctx.lineTo(x + w, y + h / 2);
+  } else {
+    ctx.moveTo(x + w, y); ctx.lineTo(x, y + h / 2);
+    ctx.moveTo(x + w, y + h); ctx.lineTo(x, y + h / 2);
+  }
+  ctx.stroke();
+  ctx.restore();
+}
+
 function drawField() {
   const w = FIELD_W, h = FIELD_H;
   const goalTop = h / 2 - GOAL_SIZE / 2, goalBot = h / 2 + GOAL_SIZE / 2;
@@ -188,18 +427,9 @@ function drawField() {
   ctx.strokeRect(WALL_THICKNESS, h / 2 - 140, 120, 280);
   ctx.strokeRect(w - WALL_THICKNESS - 120, h / 2 - 140, 120, 280);
 
-  ctx.fillStyle = 'rgba(239,68,68,0.15)'; ctx.fillRect(-GOAL_DEPTH, goalTop, GOAL_DEPTH, GOAL_SIZE);
-  ctx.strokeStyle = 'rgba(239,68,68,0.4)'; ctx.lineWidth = 2; ctx.strokeRect(-GOAL_DEPTH, goalTop, GOAL_DEPTH, GOAL_SIZE);
-  ctx.fillStyle = 'rgba(59,130,246,0.15)'; ctx.fillRect(w, goalTop, GOAL_DEPTH, GOAL_SIZE);
-  ctx.strokeStyle = 'rgba(59,130,246,0.4)'; ctx.strokeRect(w, goalTop, GOAL_DEPTH, GOAL_SIZE);
-
-  ctx.strokeStyle = 'rgba(255,255,255,0.1)'; ctx.lineWidth = 1;
-  for (let y = goalTop; y <= goalBot; y += 12) {
-    ctx.beginPath(); ctx.moveTo(-GOAL_DEPTH, y); ctx.lineTo(0, y); ctx.stroke();
-    ctx.beginPath(); ctx.moveTo(w, y); ctx.lineTo(w + GOAL_DEPTH, y); ctx.stroke();
-  }
-  for (let x = -GOAL_DEPTH; x <= 0; x += 12) { ctx.beginPath(); ctx.moveTo(x, goalTop); ctx.lineTo(x, goalBot); ctx.stroke(); }
-  for (let x = w; x <= w + GOAL_DEPTH; x += 12) { ctx.beginPath(); ctx.moveTo(x, goalTop); ctx.lineTo(x, goalBot); ctx.stroke(); }
+  // Draw detailed nets
+  drawGoalNet(-GOAL_DEPTH, goalTop, GOAL_DEPTH, GOAL_SIZE, true);
+  drawGoalNet(w, goalTop, GOAL_DEPTH, GOAL_SIZE, false);
 
   ctx.fillStyle = '#2d3748';
   ctx.fillRect(-GOAL_DEPTH, -4, w + GOAL_DEPTH * 2, WALL_THICKNESS + 4);
@@ -218,7 +448,9 @@ function drawField() {
 
 function drawBall(ball) {
   if (!ball) return;
-  ctx.beginPath(); ctx.arc(ball.x + 2, ball.y + 3, ball.radius, 0, Math.PI * 2); ctx.fillStyle = 'rgba(0,0,0,0.3)'; ctx.fill();
+  // Improved shadow
+  ctx.beginPath(); ctx.arc(ball.x + 4, ball.y + 6, ball.radius, 0, Math.PI * 2); ctx.fillStyle = 'rgba(0,0,0,0.25)'; ctx.fill();
+  
   ctx.beginPath(); ctx.arc(ball.x, ball.y, ball.radius, 0, Math.PI * 2);
   const g = ctx.createRadialGradient(ball.x - 3, ball.y - 3, 1, ball.x, ball.y, ball.radius);
   g.addColorStop(0, '#ffffff'); g.addColorStop(1, '#d1d5db'); ctx.fillStyle = g; ctx.fill();
@@ -235,7 +467,9 @@ function drawPlayers(players) {
     const tl = p.team === 'red' ? '#fca5a5' : '#93c5fd';
     const td = p.team === 'red' ? '#b91c1c' : '#1d4ed8';
 
-    ctx.beginPath(); ctx.arc(p.x + 1, p.y + 3, p.radius, 0, Math.PI * 2); ctx.fillStyle = 'rgba(0,0,0,0.25)'; ctx.fill();
+    // Improved soft shadow
+    ctx.beginPath(); ctx.arc(p.x + 3, p.y + 5, p.radius, 0, Math.PI * 2); ctx.fillStyle = 'rgba(0,0,0,0.22)'; ctx.fill();
+    
     ctx.beginPath(); ctx.arc(p.x, p.y, p.radius, 0, Math.PI * 2);
     const g = ctx.createRadialGradient(p.x - 4, p.y - 4, 2, p.x, p.y, p.radius);
     g.addColorStop(0, tl); g.addColorStop(1, tc); ctx.fillStyle = g; ctx.fill();
@@ -246,11 +480,15 @@ function drawPlayers(players) {
       ctx.strokeStyle = 'rgba(34,211,238,0.35)'; ctx.lineWidth = 2; ctx.stroke();
     }
 
+    // Resolve nickname from cache
+    const cached = playerCache.get(p.id);
+    const nicknameStr = cached ? cached.nickname : (p.nickname || 'Jugador');
+
     ctx.fillStyle = '#fff';
     ctx.font = `bold ${isMe ? 11 : 10}px Inter,sans-serif`;
     ctx.textAlign = 'center'; ctx.textBaseline = 'bottom';
     ctx.shadowColor = 'rgba(0,0,0,0.7)'; ctx.shadowBlur = 3;
-    ctx.fillText(p.nickname, p.x, p.y - p.radius - 5);
+    ctx.fillText(nicknameStr, p.x, p.y - p.radius - 5);
     ctx.shadowBlur = 0;
   });
 }
@@ -260,16 +498,12 @@ const keyMap = { ArrowUp: 'up', w: 'up', W: 'up', ArrowDown: 'down', s: 'down', 
 
 document.addEventListener('keydown', e => {
   if (e.target.tagName === 'INPUT') return;
-  const a = keyMap[e.key]; if (a) { e.preventDefault(); keys[a] = true; sendInput(); }
+  const a = keyMap[e.key]; if (a) { e.preventDefault(); keys[a] = true; }
 });
 document.addEventListener('keyup', e => {
   if (e.target.tagName === 'INPUT') return;
-  const a = keyMap[e.key]; if (a) { keys[a] = false; sendInput(); }
+  const a = keyMap[e.key]; if (a) { keys[a] = false; }
 });
-function sendInput() {
-  const enc = JSON.stringify(keys);
-  if (enc !== lastSentInput) { lastSentInput = enc; socket.emit('playerInput', keys); }
-}
 
 // ─── SCREENS & UI ────────────────────────────────────────────
 function showScreen(name) { Object.values(screens).forEach(s => s.classList.remove('active')); screens[name].classList.add('active'); if (name === 'game') resizeCanvas(); }
@@ -297,10 +531,17 @@ socket.on('joinError', msg => alert(msg));
 socket.on('connect', () => { myId = socket.id; });
 
 socket.on('roomJoined', data => {
+  myId = socket.id;
   currentRoomId = data.roomId; isHost = data.isHost;
   els.roomNameDisplay.textContent = data.roomName;
   els.settingMaxScore.value = data.maxScore || 5; els.settingTimeLimit.value = data.timeLimit || 180;
-  gameRunning = false; prevSnapshot = null; curSnapshot = null; localPlayerActive = false;
+  gameRunning = false; hasReceivedFirstState = false; targetPlayers.clear(); renderPlayers = []; localPlayerActive = false;
+  localPlayerPrev.x = 0; localPlayerPrev.y = 0;
+  inputHistory.length = 0;
+  snapshotQueue.length = 0;
+  clientInputSeq = 0;
+  visualOffset.x = 0;
+  visualOffset.y = 0;
   els.chatLog.innerHTML = ''; els.scoreRed.textContent = '0'; els.scoreBlue.textContent = '0'; els.timerDisplay.textContent = '0:00';
   updateHostUI(); updatePlayerLists(data.players); showScreen('game');
   showOverlay('Esperando jugadores...\n\nWASD / Flechas = moverse\nESPACIO / X = patear');
@@ -322,24 +563,173 @@ socket.on('goalScored', d => {
   els.scoreRed.textContent = d.scoreRed; els.scoreBlue.textContent = d.scoreBlue;
   els.goalScorer.textContent = d.scorer; els.goalBanner.classList.remove('hidden');
   setTimeout(() => els.goalBanner.classList.add('hidden'), 2000);
+
+  // Confetti effect at the scored goal (opposite of scoring team)
+  const confettiX = d.team === 'blue' ? 10 : FIELD_W - 10;
+  const confettiY = FIELD_H / 2;
+  const colors = ['#f43f5e', '#3b82f6', '#10b981', '#eab308', '#a855f7', '#ec4899', '#f97316'];
+  for (let i = 0; i < 70; i++) {
+    const randColor = colors[Math.floor(Math.random() * colors.length)];
+    const angle = d.team === 'blue' ? (Math.random() * 0.6 - 0.3) * Math.PI : (Math.random() * 0.6 + 0.7) * Math.PI;
+    const velocity = 3 + Math.random() * 6;
+    particles.push({
+      x: confettiX,
+      y: confettiY + (Math.random() - 0.5) * GOAL_SIZE,
+      vx: Math.cos(angle) * velocity,
+      vy: Math.sin(angle) * velocity - (2 + Math.random() * 3),
+      color: randColor,
+      size: 2 + Math.random() * 3,
+      alpha: 1,
+      decay: 0.01 + Math.random() * 0.012,
+      gravity: 0.12
+    });
+  }
+  shakeAmount = 18;
 });
 
 // ─── SERVER SNAPSHOTS (20Hz) ─────────────────────────────────
 socket.on('gameState', state => {
-  prevSnapshot = curSnapshot;
-  curSnapshot = state;
-  snapshotTime = performance.now();
+  hasReceivedFirstState = true;
 
-  // Correct local player towards server position
+  // Store snapshot in queue with local time
+  snapshotQueue.push({
+    time: performance.now(),
+    state: state
+  });
+  if (snapshotQueue.length > 30) {
+    snapshotQueue.shift();
+  }
+
+  // Update targets
+  targetBall.x = state.ball.x;
+  targetBall.y = state.ball.y;
+  targetBall.vx = state.ball.vx;
+  targetBall.vy = state.ball.vy;
+  
+  // Clean up targetPlayers not in the new snapshot
+  const currentIds = new Set(state.players.map(p => p.id));
+  for (const id of targetPlayers.keys()) {
+    if (!currentIds.has(id)) {
+      targetPlayers.delete(id);
+    }
+  }
+
+  // Update target players
+  state.players.forEach(p => {
+    targetPlayers.set(p.id, {
+      x: p.x,
+      y: p.y,
+      vx: p.vx,
+      vy: p.vy,
+      team: p.team,
+      radius: p.radius,
+      ping: p.ping || 0
+    });
+  });
+
+  // Update ping and map cache
+  state.players.forEach(p => {
+    const cached = playerCache.get(p.id);
+    if (cached) {
+      cached.ping = p.ping || 0;
+    }
+    const pingEl = document.getElementById(`ping-${p.id}`);
+    if (pingEl) {
+      const pingVal = p.ping || 0;
+      pingEl.textContent = `${pingVal}ms`;
+      pingEl.style.color = pingVal < 70 ? '#10b981' : (pingVal < 150 ? '#fbbf24' : '#ef4444');
+    }
+  });
+
+  // Detect ball velocity changes for impact VFX
+  const cb = state.ball;
+  if (cb) {
+    const dvx = cb.vx - lastBallVx;
+    const dvy = cb.vy - lastBallVy;
+    const deltaSpeed = Math.sqrt(dvx * dvx + dvy * dvy);
+    
+    if (deltaSpeed > 1.2) {
+      let sparkColor = '#fcd34d'; // yellow sparks default
+      let closestPlayer = null;
+      let minDist = 9999;
+      state.players.forEach(p => {
+        const dx = p.x - cb.x;
+        const dy = p.y - cb.y;
+        const d = Math.sqrt(dx * dx + dy * dy);
+        if (d < minDist) {
+          minDist = d;
+          closestPlayer = p;
+        }
+      });
+      
+      if (closestPlayer && minDist < closestPlayer.radius + cb.radius + 15) {
+        // Player kicked or hit ball
+        const cached = playerCache.get(closestPlayer.id);
+        const team = cached ? cached.team : closestPlayer.team;
+        sparkColor = team === 'red' ? '#fca5a5' : '#93c5fd';
+        spawnParticles(cb.x, cb.y, sparkColor, 12, 3.5, [1.5, 3.2], [0.03, 0.06]);
+        shakeAmount = Math.min(shakeAmount + deltaSpeed * 1.4, 7);
+      } else {
+        // Wall or post bounce
+        spawnParticles(cb.x, cb.y, '#e2e8f0', 8, 2.5, [1, 2.5], [0.04, 0.08]);
+        shakeAmount = Math.min(shakeAmount + deltaSpeed * 0.8, 4.5);
+      }
+    }
+    lastBallVx = cb.vx;
+    lastBallVy = cb.vy;
+  }
+
+  // Correct local player towards server position (Input Reconciliation)
   const me = state.players.find(p => p.id === myId);
   if (me) {
     if (!localPlayerActive) {
       localPlayer.x = me.x; localPlayer.y = me.y;
-      localPlayer.vx = 0; localPlayer.vy = 0;
+      localPlayer.vx = me.vx; localPlayer.vy = me.vy;
       localPlayer.radius = me.radius;
+      localPlayerPrev.x = me.x; localPlayerPrev.y = me.y;
       localPlayerActive = true;
+      visualOffset.x = 0; visualOffset.y = 0;
     } else {
-      correctLocalPlayer(me.x, me.y);
+      // 1. Keep track of the current predicted position before reconciliation
+      const oldX = localPlayer.x;
+      const oldY = localPlayer.y;
+
+      // 2. Reset local player state to server snapshot
+      localPlayer.x = me.x;
+      localPlayer.y = me.y;
+      localPlayer.vx = me.vx;
+      localPlayer.vy = me.vy;
+      localPlayer.radius = me.radius;
+
+      // 3. Remove all inputs acknowledged by the server
+      const serverSeq = me.lastProcessedSeq || 0;
+      while (inputHistory.length > 0 && inputHistory[0].seq <= serverSeq) {
+        inputHistory.shift();
+      }
+
+      // 4. Replay all remaining unacknowledged inputs
+      inputHistory.forEach(item => {
+        updateLocalPlayer(item.keys);
+      });
+
+      // 5. Update the visual offset to smooth out prediction errors
+      const diffX = oldX - localPlayer.x;
+      const diffY = oldY - localPlayer.y;
+      
+      // If there's a massive teleport (like goal kickoff reset), don't smooth it, just snap
+      if (Math.abs(diffX) > 120 || Math.abs(diffY) > 120) {
+        visualOffset.x = 0;
+        visualOffset.y = 0;
+        localPlayerPrev.x = localPlayer.x;
+        localPlayerPrev.y = localPlayer.y;
+      } else {
+        visualOffset.x += diffX;
+        visualOffset.y += diffY;
+        
+        // Correctly align the interpolation base to keep prediction interpolation working
+        localPlayerPrev.x = localPlayer.x - localPlayer.vx;
+        localPlayerPrev.y = localPlayer.y - localPlayer.vy;
+      }
     }
   }
 
@@ -353,11 +743,23 @@ socket.on('gameState', state => {
   }
 });
 
-socket.on('kicked', msg => { alert(msg); currentRoomId = null; gameRunning = false; curSnapshot = null; localPlayerActive = false; showScreen('lobby'); socket.emit('getRooms'); });
+socket.on('kicked', msg => { alert(msg); currentRoomId = null; gameRunning = false; hasReceivedFirstState = false; targetPlayers.clear(); renderPlayers = []; localPlayerActive = false; showScreen('lobby'); socket.emit('getRooms'); });
 
 document.querySelectorAll('.btn-team').forEach(b => b.addEventListener('click', () => socket.emit('changeTeam', b.dataset.team)));
 
 function updatePlayerLists(players) {
+  // Update local player cache map
+  playerCache.clear();
+  players.forEach(p => {
+    playerCache.set(p.id, {
+      nickname: p.nickname,
+      team: p.team,
+      isHost: p.isHost,
+      goals: p.goals || 0,
+      ping: p.ping || 0
+    });
+  });
+
   const r = players.filter(p => p.team === 'red'), b = players.filter(p => p.team === 'blue'), s = players.filter(p => p.team === 'spectator');
   els.teamRedList.innerHTML = r.map(p => playerHTML(p)).join('');
   els.teamBlueList.innerHTML = b.map(p => playerHTML(p)).join('');
@@ -367,14 +769,17 @@ function updatePlayerLists(players) {
 function playerHTML(p) {
   const host = p.isHost ? '<span class="player-host">★ HOST</span>' : '';
   const kick = (isHost && p.id !== myId) ? `<button class="player-kick-btn" data-player-id="${p.id}">✕</button>` : '';
-  return `<div class="team-player"><span class="player-name">${escapeHtml(p.nickname)}${p.id === myId ? ' (tú)' : ''}</span><span>${host}${kick}</span></div>`;
+  const pingVal = playerCache.get(p.id)?.ping || p.ping || 0;
+  const pingColor = pingVal < 70 ? '#10b981' : (pingVal < 150 ? '#fbbf24' : '#ef4444');
+  const pingSpan = `<span class="player-ping" id="ping-${p.id}" style="color:${pingColor}; font-size: 0.75rem; margin-left: 6px; font-variant-numeric: tabular-nums;">${pingVal}ms</span>`;
+  return `<div class="team-player"><span class="player-name">${escapeHtml(p.nickname)}${p.id === myId ? ' (tú)' : ''}${pingSpan}</span><span>${host}${kick}</span></div>`;
 }
 
 function updateHostUI() { els.hostControls.style.display = isHost ? 'block' : 'none'; els.btnStartGame.style.display = gameRunning ? 'none' : 'block'; els.btnStopGame.style.display = gameRunning ? 'block' : 'none'; }
 els.btnStartGame.addEventListener('click', () => socket.emit('startGame'));
 els.btnStopGame.addEventListener('click', () => socket.emit('stopGame'));
 els.btnSaveSettings.addEventListener('click', () => socket.emit('updateSettings', { maxScore: parseInt(els.settingMaxScore.value) || 5, timeLimit: parseInt(els.settingTimeLimit.value) || 0 }));
-els.btnLeave.addEventListener('click', () => { socket.emit('leaveRoom'); currentRoomId = null; gameRunning = false; curSnapshot = null; localPlayerActive = false; showScreen('lobby'); socket.emit('getRooms'); });
+els.btnLeave.addEventListener('click', () => { socket.emit('leaveRoom'); currentRoomId = null; gameRunning = false; hasReceivedFirstState = false; targetPlayers.clear(); renderPlayers = []; localPlayerActive = false; showScreen('lobby'); socket.emit('getRooms'); });
 
 els.btnSendChat.addEventListener('click', sendChat);
 els.chatInput.addEventListener('keydown', e => { if (e.key === 'Enter') sendChat(); });
@@ -392,3 +797,17 @@ function hideOverlay() { els.overlayContent.classList.add('hidden'); }
 
 requestAnimationFrame(render);
 setInterval(() => { if (screens.lobby.classList.contains('active')) socket.emit('getRooms'); }, 5000);
+
+// ─── PING/PONG LOOP ──────────────────────────────────────────
+setInterval(() => {
+  if (currentRoomId) {
+    socket.emit('pingRequest', { clientTime: Date.now() });
+  }
+}, 2000);
+
+socket.on('pingResponse', data => {
+  if (data && data.clientTime) {
+    const pingVal = Date.now() - data.clientTime;
+    socket.emit('pingUpdate', pingVal);
+  }
+});

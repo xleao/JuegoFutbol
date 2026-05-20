@@ -21,11 +21,11 @@ const WALL_THICKNESS = 6;
 const GOAL_SIZE = 160;
 const PLAYER_RADIUS = 18;
 const BALL_RADIUS = 12;
-const PLAYER_SPEED = 1.4;
-const PLAYER_KICK_POWER = 3.8;
+const PLAYER_SPEED = 0.35;
+const PLAYER_KICK_POWER = 3.5;
 const KICK_RANGE = PLAYER_RADIUS + BALL_RADIUS + 6;
-const FRICTION_PLAYER = 0.84;
-const FRICTION_BALL = 0.99;
+const FRICTION_PLAYER = 0.94;
+const FRICTION_BALL = 0.985;
 const BOUNCE_FACTOR = 0.6;
 const MAX_SCORE = 5;
 const KICKOFF_FREEZE_MS = 1500;
@@ -86,6 +86,8 @@ function addPlayerToRoom(room, socketId, nickname) {
     input: { up: false, down: false, left: false, right: false, kick: false },
     goals: 0,
     assists: 0,
+    ping: 0,
+    lastProcessedSeq: 0,
   };
 
   spawnPlayer(player, room);
@@ -145,7 +147,7 @@ function circleDist(a, b) {
   return Math.sqrt(dx * dx + dy * dy);
 }
 
-function resolveCircleCollision(a, b, bounce) {
+function resolveCircleCollisionWithMass(a, b, massA, massB, bounce) {
   const dx = b.x - a.x;
   const dy = b.y - a.y;
   const dist = Math.sqrt(dx * dx + dy * dy);
@@ -156,11 +158,15 @@ function resolveCircleCollision(a, b, bounce) {
     const ny = dy / dist;
     const overlap = minDist - dist;
 
+    const totalMass = massA + massB;
+    const ratioA = massB / totalMass;
+    const ratioB = massA / totalMass;
+
     // Separate
-    a.x -= nx * overlap * 0.5;
-    a.y -= ny * overlap * 0.5;
-    b.x += nx * overlap * 0.5;
-    b.y += ny * overlap * 0.5;
+    a.x -= nx * overlap * ratioA;
+    a.y -= ny * overlap * ratioA;
+    b.x += nx * overlap * ratioB;
+    b.y += ny * overlap * ratioB;
 
     // Relative velocity
     const dvx = a.vx - b.vx;
@@ -168,10 +174,11 @@ function resolveCircleCollision(a, b, bounce) {
     const dvn = dvx * nx + dvy * ny;
 
     if (dvn > 0) {
-      a.vx -= dvn * nx * bounce;
-      a.vy -= dvn * ny * bounce;
-      b.vx += dvn * nx * bounce;
-      b.vy += dvn * ny * bounce;
+      const impulse = (1 + bounce) * dvn / (1 / massA + 1 / massB);
+      a.vx -= (impulse / massA) * nx;
+      a.vy -= (impulse / massA) * ny;
+      b.vx += (impulse / massB) * nx;
+      b.vy += (impulse / massB) * ny;
     }
   }
 }
@@ -350,21 +357,10 @@ function updatePhysics(room) {
   // Player-ball collisions
   room.players.forEach(player => {
     if (player.team === 'spectator') return;
-    const dx = room.ball.x - player.x;
-    const dy = room.ball.y - player.y;
-    const dist = Math.sqrt(dx * dx + dy * dy);
+    const dist = circleDist(player, room.ball);
     const minDist = player.radius + room.ball.radius;
     if (dist < minDist && dist > 0) {
-      const nx = dx / dist;
-      const ny = dy / dist;
-      const overlap = minDist - dist;
-      room.ball.x += nx * overlap;
-      room.ball.y += ny * overlap;
-      const relVel = (player.vx - room.ball.vx) * nx + (player.vy - room.ball.vy) * ny;
-      if (relVel > 0) {
-        room.ball.vx += relVel * nx * 1.2;
-        room.ball.vy += relVel * ny * 1.2;
-      }
+      resolveCircleCollisionWithMass(player, room.ball, 2.5, 0.5, 0.45);
       room.ball.lastTouchedBy = player.id;
     }
   });
@@ -373,7 +369,7 @@ function updatePhysics(room) {
   const playersArr = [...room.players.values()].filter(p => p.team !== 'spectator');
   for (let i = 0; i < playersArr.length; i++) {
     for (let j = i + 1; j < playersArr.length; j++) {
-      resolveCircleCollision(playersArr[i], playersArr[j], 0.5);
+      resolveCircleCollisionWithMass(playersArr[i], playersArr[j], 1, 1, 0.5);
     }
   }
 }
@@ -429,7 +425,6 @@ function broadcastGameState(room) {
   room.players.forEach(p => {
     players.push({
       id: p.id,
-      nickname: p.nickname,
       team: p.team,
       x: Math.round(p.x * 10) / 10,
       y: Math.round(p.y * 10) / 10,
@@ -437,6 +432,8 @@ function broadcastGameState(room) {
       vy: Math.round(p.vy * 100) / 100,
       radius: p.radius,
       goals: p.goals,
+      ping: p.ping || 0,
+      lastProcessedSeq: p.lastProcessedSeq || 0,
     });
   });
 
@@ -506,6 +503,19 @@ io.on('connection', (socket) => {
 
   socket.on('getRooms', () => {
     socket.emit('roomList', getRoomList());
+  });
+
+  socket.on('pingRequest', (data) => {
+    socket.emit('pingResponse', data);
+  });
+
+  socket.on('pingUpdate', (pingVal) => {
+    if (currentRoom) {
+      const player = currentRoom.players.get(socket.id);
+      if (player) {
+        player.ping = pingVal;
+      }
+    }
   });
 
   socket.on('createRoom', (data) => {
@@ -653,17 +663,30 @@ io.on('connection', (socket) => {
     }
   });
 
-  socket.on('playerInput', (input) => {
+  socket.on('playerInput', (data) => {
     if (!currentRoom) return;
     const player = currentRoom.players.get(socket.id);
     if (!player) return;
-    player.input = {
-      up: !!input.up,
-      down: !!input.down,
-      left: !!input.left,
-      right: !!input.right,
-      kick: !!input.kick,
-    };
+    if (data && typeof data.seq === 'number') {
+      if (data.seq > player.lastProcessedSeq) {
+        player.input = {
+          up: !!data.keys?.up,
+          down: !!data.keys?.down,
+          left: !!data.keys?.left,
+          right: !!data.keys?.right,
+          kick: !!data.keys?.kick,
+        };
+        player.lastProcessedSeq = data.seq;
+      }
+    } else if (data) {
+      player.input = {
+        up: !!data.up,
+        down: !!data.down,
+        left: !!data.left,
+        right: !!data.right,
+        kick: !!data.kick,
+      };
+    }
   });
 
   socket.on('chatMessage', (msg) => {
