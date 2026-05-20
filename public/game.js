@@ -45,6 +45,11 @@ let localPlayer = { x: 0, y: 0, vx: 0, vy: 0, radius: 18 };
 let localPlayerPrev = { x: 0, y: 0 };
 let localPlayerActive = false;
 
+// ─── LOCAL BALL PREDICTION & SMOOTHING ────────────────────────
+let localBall = { x: FIELD_W / 2, y: FIELD_H / 2, vx: 0, vy: 0, radius: 12 };
+let localBallPrev = { x: FIELD_W / 2, y: FIELD_H / 2 };
+let ballVisualOffset = { x: 0, y: 0 };
+
 // ─── SMOOTH RENDERING FOR ENTITIES ───────────────────────────
 const targetPlayers = new Map(); // player.id -> {x, y, team, radius, ping}
 let targetBall = { x: FIELD_W / 2, y: FIELD_H / 2 };
@@ -98,6 +103,174 @@ function updateLocalPlayer(inputKeys = keys) {
 }
 
 // Gently correct local player position towards server truth
+// ─── PHYSICS FUNCTIONS & COLLISIONS ──────────────────────────
+function resolveCircleCollisionWithMass(a, b, massA, massB, bounce) {
+  const dx = b.x - a.x;
+  const dy = b.y - a.y;
+  const dist = Math.sqrt(dx * dx + dy * dy);
+  const minDist = a.radius + b.radius;
+
+  if (dist < minDist && dist > 0) {
+    const nx = dx / dist;
+    const ny = dy / dist;
+    const overlap = minDist - dist;
+
+    const totalMass = massA + massB;
+    const ratioA = massB / totalMass;
+    const ratioB = massA / totalMass;
+
+    // Separate
+    a.x -= nx * overlap * ratioA;
+    a.y -= ny * overlap * ratioA;
+    b.x += nx * overlap * ratioB;
+    b.y += ny * overlap * ratioB;
+
+    // Relative velocity
+    const dvx = a.vx - b.vx;
+    const dvy = a.vy - b.vy;
+    const dvn = dvx * nx + dvy * ny;
+
+    if (dvn > 0) {
+      const impulse = (1 + bounce) * dvn / (1 / massA + 1 / massB);
+      a.vx -= (impulse / massA) * nx;
+      a.vy -= (impulse / massA) * ny;
+      b.vx += (impulse / massB) * nx;
+      b.vy += (impulse / massB) * ny;
+    }
+  }
+}
+
+function resolveLocalBallWallCollisions(ball) {
+  const goalTop = FIELD_H / 2 - GOAL_SIZE / 2;
+  const goalBottom = FIELD_H / 2 + GOAL_SIZE / 2;
+  const BOUNCE_FACTOR = 0.6;
+
+  // Top wall
+  if (ball.y - ball.radius < WALL_THICKNESS) {
+    ball.y = WALL_THICKNESS + ball.radius;
+    ball.vy *= -BOUNCE_FACTOR;
+  }
+  // Bottom wall
+  if (ball.y + ball.radius > FIELD_H - WALL_THICKNESS) {
+    ball.y = FIELD_H - WALL_THICKNESS - ball.radius;
+    ball.vy *= -BOUNCE_FACTOR;
+  }
+
+  // Left wall (with goal gap)
+  if (ball.x - ball.radius < WALL_THICKNESS) {
+    if (ball.y < goalTop || ball.y > goalBottom) {
+      ball.x = WALL_THICKNESS + ball.radius;
+      ball.vx *= -BOUNCE_FACTOR;
+    }
+  }
+  // Right wall (with goal gap)
+  if (ball.x + ball.radius > FIELD_W - WALL_THICKNESS) {
+    if (ball.y < goalTop || ball.y > goalBottom) {
+      ball.x = FIELD_W - WALL_THICKNESS - ball.radius;
+      ball.vx *= -BOUNCE_FACTOR;
+    }
+  }
+
+  // Goal posts
+  const posts = [
+    { x: WALL_THICKNESS, y: goalTop, radius: 6 },
+    { x: WALL_THICKNESS, y: goalBottom, radius: 6 },
+    { x: FIELD_W - WALL_THICKNESS, y: goalTop, radius: 6 },
+    { x: FIELD_W - WALL_THICKNESS, y: goalBottom, radius: 6 },
+  ];
+  posts.forEach(post => {
+    const dx = ball.x - post.x;
+    const dy = ball.y - post.y;
+    const dist = Math.sqrt(dx * dx + dy * dy);
+    const minDist = ball.radius + post.radius;
+    if (dist < minDist && dist > 0) {
+      const nx = dx / dist;
+      const ny = dy / dist;
+      ball.x = post.x + nx * minDist;
+      ball.y = post.y + ny * minDist;
+      const dot = ball.vx * nx + ball.vy * ny;
+      ball.vx -= 2 * dot * nx * BOUNCE_FACTOR;
+      ball.vy -= 2 * dot * ny * BOUNCE_FACTOR;
+    }
+  });
+
+  // Goal back walls (prevent ball from going too far)
+  if (ball.x < -GOAL_DEPTH) {
+    ball.x = -GOAL_DEPTH;
+    ball.vx *= -0.3;
+  }
+  if (ball.x > FIELD_W + GOAL_DEPTH) {
+    ball.x = FIELD_W + GOAL_DEPTH;
+    ball.vx *= -0.3;
+  }
+}
+
+function updateLocalBall() {
+  localBall.vx *= FRICTION_BALL;
+  localBall.vy *= FRICTION_BALL;
+  
+  if (Math.abs(localBall.vx) < 0.01) localBall.vx = 0;
+  if (Math.abs(localBall.vy) < 0.01) localBall.vy = 0;
+
+  localBall.x += localBall.vx;
+  localBall.y += localBall.vy;
+}
+
+function resolvePlayerPlayerCollisions() {
+  targetPlayers.forEach((other, id) => {
+    if (id === myId) return;
+    if (other.team === 'spectator') return;
+
+    const dx = other.x - localPlayer.x;
+    const dy = other.y - localPlayer.y;
+    const dist = Math.sqrt(dx * dx + dy * dy);
+    const minDist = localPlayer.radius + (other.radius || 18);
+    if (dist < minDist && dist > 0) {
+      const nx = dx / dist;
+      const ny = dy / dist;
+      const overlap = minDist - dist;
+
+      // Push local player back by 50% (matching the server's equal mass resolution)
+      localPlayer.x -= nx * overlap * 0.5;
+      localPlayer.y -= ny * overlap * 0.5;
+
+      // Reflect local player velocity (matching server's impulse with massA=1, massB=1, bounce=0.5)
+      const dvx = localPlayer.vx - (other.vx || 0);
+      const dvy = localPlayer.vy - (other.vy || 0);
+      const dvn = dvx * nx + dvy * ny;
+      if (dvn > 0) {
+        const impulse = 0.75 * dvn; // (1 + bounce) * dvn / (1/mA + 1/mB) = 1.5 * dvn / 2 = 0.75 * dvn
+        localPlayer.vx -= impulse * nx;
+        localPlayer.vy -= impulse * ny;
+      }
+    }
+  });
+}
+
+function handleLocalKick(inputKeys) {
+  if (!inputKeys.kick) return;
+  const dx = localBall.x - localPlayer.x;
+  const dy = localBall.y - localPlayer.y;
+  const dist = Math.sqrt(dx * dx + dy * dy);
+  const kickRange = localPlayer.radius + localBall.radius + 6;
+  if (dist < kickRange) {
+    const d = dist || 1;
+    const PLAYER_KICK_POWER = 3.5;
+    
+    const kickDirX = dx / d;
+    const kickDirY = dy / d;
+    
+    const speedProj = localBall.vx * kickDirX + localBall.vy * kickDirY;
+    if (speedProj < 0) {
+      localBall.vx -= speedProj * kickDirX;
+      localBall.vy -= speedProj * kickDirY;
+    }
+    
+    localBall.vx += kickDirX * PLAYER_KICK_POWER;
+    localBall.vy += kickDirY * PLAYER_KICK_POWER;
+  }
+}
+
 // ─── INTERPOLATION ───────────────────────────────────────────
 function lerp(a, b, t) { return a + (b - a) * t; }
 
@@ -168,15 +341,26 @@ function drawBallTrail() {
 function updateRenderPositions(dt) {
   if (!hasReceivedFirstState) return;
 
-  // Visual error offset decay for local player
+  // Visual error offset decay for local player and ball
   visualOffset.x *= 0.85;
   visualOffset.y *= 0.85;
   if (Math.abs(visualOffset.x) < 0.01) visualOffset.x = 0;
   if (Math.abs(visualOffset.y) < 0.01) visualOffset.y = 0;
 
+  ballVisualOffset.x *= 0.85;
+  ballVisualOffset.y *= 0.85;
+  if (Math.abs(ballVisualOffset.x) < 0.01) ballVisualOffset.x = 0;
+  if (Math.abs(ballVisualOffset.y) < 0.01) ballVisualOffset.y = 0;
+
   // If there are not enough snapshots, fallback to direct positioning
   if (snapshotQueue.length < 2) {
-    if (renderBall) {
+    if (localPlayerActive) {
+      const alpha = physicsAccumulator / 16.67;
+      renderBall.x = lerp(localBallPrev.x, localBall.x, alpha) + ballVisualOffset.x;
+      renderBall.y = lerp(localBallPrev.y, localBall.y, alpha) + ballVisualOffset.y;
+      renderBall.vx = localBall.vx;
+      renderBall.vy = localBall.vy;
+    } else {
       renderBall.x = targetBall.x;
       renderBall.y = targetBall.y;
     }
@@ -233,12 +417,21 @@ function updateRenderPositions(dt) {
   // Calculate interpolation factor
   const t = s0 === s1 ? 0 : (renderTime - s0.time) / (s1.time - s0.time);
 
-  // 1. Interpolate Ball
-  renderBall.x = lerp(s0.state.ball.x, s1.state.ball.x, t);
-  renderBall.y = lerp(s0.state.ball.y, s1.state.ball.y, t);
-  renderBall.vx = lerp(s0.state.ball.vx || 0, s1.state.ball.vx || 0, t);
-  renderBall.vy = lerp(s0.state.ball.vy || 0, s1.state.ball.vy || 0, t);
-  renderBall.radius = s0.state.ball.radius || 12;
+  // 1. Interpolate or Predict Ball
+  if (localPlayerActive) {
+    const alpha = physicsAccumulator / 16.67;
+    renderBall.x = lerp(localBallPrev.x, localBall.x, alpha) + ballVisualOffset.x;
+    renderBall.y = lerp(localBallPrev.y, localBall.y, alpha) + ballVisualOffset.y;
+    renderBall.vx = localBall.vx;
+    renderBall.vy = localBall.vy;
+    renderBall.radius = localBall.radius;
+  } else {
+    renderBall.x = lerp(s0.state.ball.x, s1.state.ball.x, t);
+    renderBall.y = lerp(s0.state.ball.y, s1.state.ball.y, t);
+    renderBall.vx = lerp(s0.state.ball.vx || 0, s1.state.ball.vx || 0, t);
+    renderBall.vy = lerp(s0.state.ball.vy || 0, s1.state.ball.vy || 0, t);
+    renderBall.radius = s0.state.ball.radius || 12;
+  }
 
   // 2. Interpolate Players (local uses prediction, remotes use snapshot interpolation)
   const newRenderPlayers = [];
@@ -318,6 +511,8 @@ function render(timestamp) {
     while (physicsAccumulator >= 16.67) {
       localPlayerPrev.x = localPlayer.x;
       localPlayerPrev.y = localPlayer.y;
+      localBallPrev.x = localBall.x;
+      localBallPrev.y = localBall.y;
 
       clientInputSeq++;
       inputHistory.push({
@@ -326,7 +521,30 @@ function render(timestamp) {
       });
       if (inputHistory.length > 300) inputHistory.shift();
 
+      // 1. Mover jugador local
       updateLocalPlayer(keys);
+
+      // 2. Simular balón físicamente
+      updateLocalBall();
+
+      // 3. Resolvedor de Colisiones Multipaso (3 iteraciones)
+      for (let iter = 0; iter < 3; iter++) {
+        // A. Colisionar jugador con otros jugadores (obstáculos semi-estáticos)
+        resolvePlayerPlayerCollisions();
+
+        // B. Colisionar jugador con el balón
+        resolveCircleCollisionWithMass(localPlayer, localBall, 2.5, 0.5, 0.45);
+
+        // C. Clamp jugador local a los límites del campo
+        localPlayer.x = Math.max(localPlayer.radius + WALL_THICKNESS, Math.min(FIELD_W - localPlayer.radius - WALL_THICKNESS, localPlayer.x));
+        localPlayer.y = Math.max(localPlayer.radius + WALL_THICKNESS, Math.min(FIELD_H - localPlayer.radius - WALL_THICKNESS, localPlayer.y));
+
+        // D. Colisionar balón con paredes y postes
+        resolveLocalBallWallCollisions(localBall);
+      }
+
+      // 4. Patear el balón
+      handleLocalKick(keys);
 
       if (gameRunning && localPlayerActive) {
         socket.emit('playerInput', { keys, seq: clientInputSeq });
@@ -542,6 +760,10 @@ socket.on('roomJoined', data => {
   clientInputSeq = 0;
   visualOffset.x = 0;
   visualOffset.y = 0;
+  localBall.x = FIELD_W / 2; localBall.y = FIELD_H / 2;
+  localBall.vx = 0; localBall.vy = 0;
+  localBallPrev.x = FIELD_W / 2; localBallPrev.y = FIELD_H / 2;
+  ballVisualOffset.x = 0; ballVisualOffset.y = 0;
   els.chatLog.innerHTML = ''; els.scoreRed.textContent = '0'; els.scoreBlue.textContent = '0'; els.timerDisplay.textContent = '0:00';
   updateHostUI(); updatePlayerLists(data.players); showScreen('game');
   showOverlay('Esperando jugadores...\n\nWASD / Flechas = moverse\nESPACIO / X = patear');
@@ -679,7 +901,7 @@ socket.on('gameState', state => {
     lastBallVy = cb.vy;
   }
 
-  // Correct local player towards server position (Input Reconciliation)
+  // Correct local player and ball towards server position (Input Reconciliation)
   const me = state.players.find(p => p.id === myId);
   if (me) {
     if (!localPlayerActive) {
@@ -689,17 +911,31 @@ socket.on('gameState', state => {
       localPlayerPrev.x = me.x; localPlayerPrev.y = me.y;
       localPlayerActive = true;
       visualOffset.x = 0; visualOffset.y = 0;
+
+      localBall.x = state.ball.x; localBall.y = state.ball.y;
+      localBall.vx = state.ball.vx; localBall.vy = state.ball.vy;
+      localBall.radius = state.ball.radius || 12;
+      localBallPrev.x = state.ball.x; localBallPrev.y = state.ball.y;
+      ballVisualOffset.x = 0; ballVisualOffset.y = 0;
     } else {
-      // 1. Keep track of the current predicted position before reconciliation
+      // 1. Keep track of current predicted positions before reconciliation
       const oldX = localPlayer.x;
       const oldY = localPlayer.y;
+      const oldBallX = localBall.x;
+      const oldBallY = localBall.y;
 
-      // 2. Reset local player state to server snapshot
+      // 2. Reset local player and ball state to server snapshot
       localPlayer.x = me.x;
       localPlayer.y = me.y;
       localPlayer.vx = me.vx;
       localPlayer.vy = me.vy;
       localPlayer.radius = me.radius;
+
+      localBall.x = state.ball.x;
+      localBall.y = state.ball.y;
+      localBall.vx = state.ball.vx;
+      localBall.vy = state.ball.vy;
+      localBall.radius = state.ball.radius || 12;
 
       // 3. Remove all inputs acknowledged by the server
       const serverSeq = me.lastProcessedSeq || 0;
@@ -707,9 +943,18 @@ socket.on('gameState', state => {
         inputHistory.shift();
       }
 
-      // 4. Replay all remaining unacknowledged inputs
+      // 4. Replay all remaining unacknowledged inputs (re-simulating both player and ball!)
       inputHistory.forEach(item => {
         updateLocalPlayer(item.keys);
+        updateLocalBall();
+        for (let iter = 0; iter < 3; iter++) {
+          resolvePlayerPlayerCollisions();
+          resolveCircleCollisionWithMass(localPlayer, localBall, 2.5, 0.5, 0.45);
+          localPlayer.x = Math.max(localPlayer.radius + WALL_THICKNESS, Math.min(FIELD_W - localPlayer.radius - WALL_THICKNESS, localPlayer.x));
+          localPlayer.y = Math.max(localPlayer.radius + WALL_THICKNESS, Math.min(FIELD_H - localPlayer.radius - WALL_THICKNESS, localPlayer.y));
+          resolveLocalBallWallCollisions(localBall);
+        }
+        handleLocalKick(item.keys);
       });
 
       // 5. Update the visual offset to smooth out prediction errors
@@ -729,6 +974,23 @@ socket.on('gameState', state => {
         // Correctly align the interpolation base to keep prediction interpolation working
         localPlayerPrev.x = localPlayer.x - localPlayer.vx;
         localPlayerPrev.y = localPlayer.y - localPlayer.vy;
+      }
+
+      // 6. Update the ball's visual offset to smooth out ball prediction errors
+      const diffBallX = oldBallX - localBall.x;
+      const diffBallY = oldBallY - localBall.y;
+
+      if (Math.abs(diffBallX) > 150 || Math.abs(diffBallY) > 150) {
+        ballVisualOffset.x = 0;
+        ballVisualOffset.y = 0;
+        localBallPrev.x = localBall.x;
+        localBallPrev.y = localBall.y;
+      } else {
+        ballVisualOffset.x += diffBallX;
+        ballVisualOffset.y += diffBallY;
+
+        localBallPrev.x = localBall.x - localBall.vx;
+        localBallPrev.y = localBall.y - localBall.vy;
       }
     }
   }

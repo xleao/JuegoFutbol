@@ -183,6 +183,73 @@ function resolveCircleCollisionWithMass(a, b, massA, massB, bounce) {
   }
 }
 
+function resolveBallWallAndPostCollisions(ball) {
+  const goalTop = FIELD_H / 2 - GOAL_SIZE / 2;
+  const goalBottom = FIELD_H / 2 + GOAL_SIZE / 2;
+
+  // Top wall
+  if (ball.y - ball.radius < WALL_THICKNESS) {
+    ball.y = WALL_THICKNESS + ball.radius;
+    ball.vy *= -BOUNCE_FACTOR;
+  }
+  // Bottom wall
+  if (ball.y + ball.radius > FIELD_H - WALL_THICKNESS) {
+    ball.y = FIELD_H - WALL_THICKNESS - ball.radius;
+    ball.vy *= -BOUNCE_FACTOR;
+  }
+
+  // Left wall (with goal gap)
+  if (ball.x - ball.radius < WALL_THICKNESS) {
+    if (ball.y < goalTop || ball.y > goalBottom) {
+      ball.x = WALL_THICKNESS + ball.radius;
+      ball.vx *= -BOUNCE_FACTOR;
+    }
+  }
+  // Right wall (with goal gap)
+  if (ball.x + ball.radius > FIELD_W - WALL_THICKNESS) {
+    if (ball.y < goalTop || ball.y > goalBottom) {
+      ball.x = FIELD_W - WALL_THICKNESS - ball.radius;
+      ball.vx *= -BOUNCE_FACTOR;
+    }
+  }
+
+  // Goal posts (circles at corners of goal)
+  const posts = [
+    { x: WALL_THICKNESS, y: goalTop, radius: 6 },
+    { x: WALL_THICKNESS, y: goalBottom, radius: 6 },
+    { x: FIELD_W - WALL_THICKNESS, y: goalTop, radius: 6 },
+    { x: FIELD_W - WALL_THICKNESS, y: goalBottom, radius: 6 },
+  ];
+  posts.forEach(post => {
+    const dx = ball.x - post.x;
+    const dy = ball.y - post.y;
+    const dist = Math.sqrt(dx * dx + dy * dy);
+    const minDist = ball.radius + post.radius;
+    if (dist < minDist && dist > 0) {
+      const nx = dx / dist;
+      const ny = dy / dist;
+      ball.x = post.x + nx * minDist;
+      ball.y = post.y + ny * minDist;
+      const dot = ball.vx * nx + ball.vy * ny;
+      ball.vx -= 2 * dot * nx * BOUNCE_FACTOR;
+      ball.vy -= 2 * dot * ny * BOUNCE_FACTOR;
+    }
+  });
+
+  // Goal back walls (prevent ball from going too far)
+  const GOAL_DEPTH = 40;
+  // Left goal area
+  if (ball.x < -GOAL_DEPTH) {
+    ball.x = -GOAL_DEPTH;
+    ball.vx *= -0.3;
+  }
+  // Right goal area
+  if (ball.x > FIELD_W + GOAL_DEPTH) {
+    ball.x = FIELD_W + GOAL_DEPTH;
+    ball.vx *= -0.3;
+  }
+}
+
 function updatePhysics(room) {
   const now = Date.now();
   const frozen = now < room.kickoffFreezeUntil;
@@ -198,7 +265,7 @@ function updatePhysics(room) {
     return;
   }
 
-  // Process player inputs
+  // 1. Process player inputs and update positions
   room.players.forEach(player => {
     if (player.team === 'spectator') return;
 
@@ -224,99 +291,83 @@ function updatePhysics(room) {
       player.y += player.vy;
     }
 
-    // Clamp to field
+    // Initial clamp to field
     player.x = Math.max(player.radius + WALL_THICKNESS, Math.min(FIELD_W - player.radius - WALL_THICKNESS, player.x));
     player.y = Math.max(player.radius + WALL_THICKNESS, Math.min(FIELD_H - player.radius - WALL_THICKNESS, player.y));
-
-    // Kick ball
-    if (player.input.kick && !frozen) {
-      const dist = circleDist(player, room.ball);
-      if (dist < KICK_RANGE) {
-        const dx = room.ball.x - player.x;
-        const dy = room.ball.y - player.y;
-        const d = Math.sqrt(dx * dx + dy * dy) || 1;
-        room.ball.vx += (dx / d) * PLAYER_KICK_POWER;
-        room.ball.vy += (dy / d) * PLAYER_KICK_POWER;
-        room.ball.lastTouchedBy = player.id;
-      }
-    }
   });
 
   if (frozen) return;
 
-  // Ball physics
+  // 2. Ball physics (friction and position update)
   room.ball.vx *= FRICTION_BALL;
   room.ball.vy *= FRICTION_BALL;
   room.ball.x += room.ball.vx;
   room.ball.y += room.ball.vy;
 
-  // Ball-wall collisions
-  const goalTop = FIELD_H / 2 - GOAL_SIZE / 2;
-  const goalBottom = FIELD_H / 2 + GOAL_SIZE / 2;
-
-  // Top wall
-  if (room.ball.y - room.ball.radius < WALL_THICKNESS) {
-    room.ball.y = WALL_THICKNESS + room.ball.radius;
-    room.ball.vy *= -BOUNCE_FACTOR;
-  }
-  // Bottom wall
-  if (room.ball.y + room.ball.radius > FIELD_H - WALL_THICKNESS) {
-    room.ball.y = FIELD_H - WALL_THICKNESS - room.ball.radius;
-    room.ball.vy *= -BOUNCE_FACTOR;
-  }
-
-  // Left wall (with goal gap)
-  if (room.ball.x - room.ball.radius < WALL_THICKNESS) {
-    if (room.ball.y < goalTop || room.ball.y > goalBottom) {
-      room.ball.x = WALL_THICKNESS + room.ball.radius;
-      room.ball.vx *= -BOUNCE_FACTOR;
-    }
-  }
-  // Right wall (with goal gap)
-  if (room.ball.x + room.ball.radius > FIELD_W - WALL_THICKNESS) {
-    if (room.ball.y < goalTop || room.ball.y > goalBottom) {
-      room.ball.x = FIELD_W - WALL_THICKNESS - room.ball.radius;
-      room.ball.vx *= -BOUNCE_FACTOR;
-    }
-  }
-
-  // Goal posts (circles at corners of goal)
-  const posts = [
-    { x: WALL_THICKNESS, y: goalTop, radius: 6 },
-    { x: WALL_THICKNESS, y: goalBottom, radius: 6 },
-    { x: FIELD_W - WALL_THICKNESS, y: goalTop, radius: 6 },
-    { x: FIELD_W - WALL_THICKNESS, y: goalBottom, radius: 6 },
-  ];
-  posts.forEach(post => {
-    const dx = room.ball.x - post.x;
-    const dy = room.ball.y - post.y;
-    const dist = Math.sqrt(dx * dx + dy * dy);
-    const minDist = room.ball.radius + post.radius;
-    if (dist < minDist && dist > 0) {
-      const nx = dx / dist;
-      const ny = dy / dist;
-      room.ball.x = post.x + nx * minDist;
-      room.ball.y = post.y + ny * minDist;
-      const dot = room.ball.vx * nx + room.ball.vy * ny;
-      room.ball.vx -= 2 * dot * nx * BOUNCE_FACTOR;
-      room.ball.vy -= 2 * dot * ny * BOUNCE_FACTOR;
+  // 3. Process player kick inputs with velocity redirection
+  room.players.forEach(player => {
+    if (player.team === 'spectator') return;
+    if (player.input.kick) {
+      const dist = circleDist(player, room.ball);
+      if (dist < KICK_RANGE) {
+        const dx = room.ball.x - player.x;
+        const dy = room.ball.y - player.y;
+        const d = Math.sqrt(dx * dx + dy * dy) || 1;
+        
+        const kickDirX = dx / d;
+        const kickDirY = dy / d;
+        
+        // Redirect existing ball velocity: project onto kick direction
+        const speedProj = room.ball.vx * kickDirX + room.ball.vy * kickDirY;
+        if (speedProj < 0) {
+          // Cancel out incoming velocity component in the kick direction
+          room.ball.vx -= speedProj * kickDirX;
+          room.ball.vy -= speedProj * kickDirY;
+        }
+        
+        room.ball.vx += kickDirX * PLAYER_KICK_POWER;
+        room.ball.vy += kickDirY * PLAYER_KICK_POWER;
+        room.ball.lastTouchedBy = player.id;
+      }
     }
   });
 
-  // Goal back walls (prevent ball from going too far)
-  const GOAL_DEPTH = 40;
-  // Left goal area
-  if (room.ball.x < -GOAL_DEPTH) {
-    room.ball.x = -GOAL_DEPTH;
-    room.ball.vx *= -0.3;
-  }
-  // Right goal area
-  if (room.ball.x > FIELD_W + GOAL_DEPTH) {
-    room.ball.x = FIELD_W + GOAL_DEPTH;
-    room.ball.vx *= -0.3;
+  // 4. Authoritative Multi-Pass Physics Solver (3 iterations)
+  for (let iter = 0; iter < 3; iter++) {
+    // A. Player-Player collisions
+    const playersArr = [...room.players.values()].filter(p => p.team !== 'spectator');
+    for (let i = 0; i < playersArr.length; i++) {
+      for (let j = i + 1; j < playersArr.length; j++) {
+        resolveCircleCollisionWithMass(playersArr[i], playersArr[j], 1, 1, 0.5);
+      }
+    }
+
+    // B. Player-Ball collisions
+    room.players.forEach(player => {
+      if (player.team === 'spectator') return;
+      const dist = circleDist(player, room.ball);
+      const minDist = player.radius + room.ball.radius;
+      if (dist < minDist && dist > 0) {
+        resolveCircleCollisionWithMass(player, room.ball, 2.5, 0.5, 0.45);
+        room.ball.lastTouchedBy = player.id;
+      }
+    });
+
+    // C. Clamp players to field boundaries
+    room.players.forEach(player => {
+      if (player.team === 'spectator') return;
+      player.x = Math.max(player.radius + WALL_THICKNESS, Math.min(FIELD_W - player.radius - WALL_THICKNESS, player.x));
+      player.y = Math.max(player.radius + WALL_THICKNESS, Math.min(FIELD_H - player.radius - WALL_THICKNESS, player.y));
+    });
+
+    // D. Resolve ball-wall and post collisions
+    resolveBallWallAndPostCollisions(room.ball);
   }
 
-  // Goal detection
+  // 5. Goal detection (runs after authoritative physics are settled)
+  const goalTop = FIELD_H / 2 - GOAL_SIZE / 2;
+  const goalBottom = FIELD_H / 2 + GOAL_SIZE / 2;
+
   if (room.ball.x < 0 && room.ball.y > goalTop && room.ball.y < goalBottom) {
     // GOAL for Blue team!
     room.scoreBlue++;
@@ -352,25 +403,6 @@ function updatePhysics(room) {
       resetField(room);
     }
     return;
-  }
-
-  // Player-ball collisions
-  room.players.forEach(player => {
-    if (player.team === 'spectator') return;
-    const dist = circleDist(player, room.ball);
-    const minDist = player.radius + room.ball.radius;
-    if (dist < minDist && dist > 0) {
-      resolveCircleCollisionWithMass(player, room.ball, 2.5, 0.5, 0.45);
-      room.ball.lastTouchedBy = player.id;
-    }
-  });
-
-  // Player-player collisions
-  const playersArr = [...room.players.values()].filter(p => p.team !== 'spectator');
-  for (let i = 0; i < playersArr.length; i++) {
-    for (let j = i + 1; j < playersArr.length; j++) {
-      resolveCircleCollisionWithMass(playersArr[i], playersArr[j], 1, 1, 0.5);
-    }
   }
 }
 
