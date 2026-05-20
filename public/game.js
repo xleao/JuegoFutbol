@@ -30,7 +30,7 @@ let lastBallVy = 0;
 const FIELD_W = 1200, FIELD_H = 600, GOAL_SIZE = 160, WALL_THICKNESS = 6, GOAL_DEPTH = 40;
 
 // Physics constants (must match server)
-const PLAYER_SPEED = 0.35, FRICTION_PLAYER = 0.94, FRICTION_BALL = 0.985;
+const PLAYER_SPEED = 0.25, FRICTION_PLAYER = 0.94, FRICTION_BALL = 0.985;
 
 const keys = { up: false, down: false, left: false, right: false, kick: false };
 const inputHistory = [];
