@@ -18,7 +18,9 @@ const SEND_EVERY = Math.round(TICK_RATE / SEND_RATE); // Send every N ticks
 const FIELD_W = 1200;
 const FIELD_H = 600;
 const WALL_THICKNESS = 6;
-const GOAL_SIZE = 160;
+const GOAL_SIZE = 220;
+const GOAL_DEPTH = 40;
+const BORDER_LIMIT = 40;
 const PLAYER_RADIUS = 18;
 const BALL_RADIUS = 12;
 const PLAYER_SPEED = 0.25;
@@ -39,7 +41,8 @@ function createBall() {
     y: FIELD_H / 2,
     vx: 0,
     vy: 0,
-    radius: BALL_RADIUS
+    radius: BALL_RADIUS,
+    superKicked: false
   };
 }
 
@@ -66,7 +69,8 @@ function createRoom(id, name, password, maxPlayers, hostId) {
   };
 }
 
-function addPlayerToRoom(room, socketId, nickname) {
+function addPlayerToRoom(room, socketId, nickname, power) {
+  console.log(`[DEBUG] addPlayerToRoom: socketId=${socketId}, nickname=${nickname}, argument power=${power}, final power=${power || 'superkick'}`);
   // Auto-assign team: balance teams
   const reds = [...room.players.values()].filter(p => p.team === 'red').length;
   const blues = [...room.players.values()].filter(p => p.team === 'blue').length;
@@ -83,11 +87,15 @@ function addPlayerToRoom(room, socketId, nickname) {
     vx: 0,
     vy: 0,
     radius: PLAYER_RADIUS,
-    input: { up: false, down: false, left: false, right: false, kick: false },
+    input: { up: false, down: false, left: false, right: false, kick: false, power: false },
     goals: 0,
     assists: 0,
     ping: 0,
     lastProcessedSeq: 0,
+    power: power || 'superkick',
+    powerCooldown: 0,
+    powerActive: false,
+    powerActiveTimer: 0,
   };
 
   spawnPlayer(player, room);
@@ -136,7 +144,13 @@ function spawnAllPlayers(room) {
 
 function resetField(room) {
   room.ball = createBall();
+  room.ball.superKicked = false;
   spawnAllPlayers(room);
+  room.players.forEach(p => {
+    p.powerActive = false;
+    p.powerCooldown = 0;
+    p.powerActiveTimer = 0;
+  });
   room.kickoffFreezeUntil = Date.now() + KICKOFF_FREEZE_MS;
 }
 
@@ -183,19 +197,22 @@ function resolveCircleCollisionWithMass(a, b, massA, massB, bounce) {
   }
 }
 
-function resolveBallWallAndPostCollisions(ball) {
+function resolveBallWallAndPostCollisions(ball, room) {
   const goalTop = FIELD_H / 2 - GOAL_SIZE / 2;
   const goalBottom = FIELD_H / 2 + GOAL_SIZE / 2;
+  let collided = false;
 
   // Top wall
   if (ball.y - ball.radius < WALL_THICKNESS) {
     ball.y = WALL_THICKNESS + ball.radius;
     ball.vy *= -BOUNCE_FACTOR;
+    collided = true;
   }
   // Bottom wall
   if (ball.y + ball.radius > FIELD_H - WALL_THICKNESS) {
     ball.y = FIELD_H - WALL_THICKNESS - ball.radius;
     ball.vy *= -BOUNCE_FACTOR;
+    collided = true;
   }
 
   // Left wall (with goal gap)
@@ -203,6 +220,7 @@ function resolveBallWallAndPostCollisions(ball) {
     if (ball.y < goalTop || ball.y > goalBottom) {
       ball.x = WALL_THICKNESS + ball.radius;
       ball.vx *= -BOUNCE_FACTOR;
+      collided = true;
     }
   }
   // Right wall (with goal gap)
@@ -210,6 +228,7 @@ function resolveBallWallAndPostCollisions(ball) {
     if (ball.y < goalTop || ball.y > goalBottom) {
       ball.x = FIELD_W - WALL_THICKNESS - ball.radius;
       ball.vx *= -BOUNCE_FACTOR;
+      collided = true;
     }
   }
 
@@ -233,26 +252,101 @@ function resolveBallWallAndPostCollisions(ball) {
       const dot = ball.vx * nx + ball.vy * ny;
       ball.vx -= 2 * dot * nx * BOUNCE_FACTOR;
       ball.vy -= 2 * dot * ny * BOUNCE_FACTOR;
+      collided = true;
     }
   });
 
   // Goal back walls (prevent ball from going too far)
-  const GOAL_DEPTH = 40;
   // Left goal area
   if (ball.x < -GOAL_DEPTH) {
     ball.x = -GOAL_DEPTH;
     ball.vx *= -0.3;
+    collided = true;
   }
   // Right goal area
   if (ball.x > FIELD_W + GOAL_DEPTH) {
     ball.x = FIELD_W + GOAL_DEPTH;
     ball.vx *= -0.3;
+    collided = true;
   }
+
+  if (collided && ball.superKicked && room) {
+    ball.superKicked = false;
+    broadcastToRoom(room, 'superkickImpact', { x: ball.x, y: ball.y });
+  }
+}
+
+function clampPlayer(player, goalTop, goalBottom) {
+  const r = player.radius || PLAYER_RADIUS;
+  
+  // Clamp Y to the absolute outer boundaries
+  player.y = Math.max(-BORDER_LIMIT + r, Math.min(FIELD_H + BORDER_LIMIT - r, player.y));
+
+  // Left boundary check
+  if (player.x - r < WALL_THICKNESS) {
+    if (player.y >= goalTop && player.y <= goalBottom) {
+      // Inside Left Goal
+      player.x = Math.max(-GOAL_DEPTH + r, player.x);
+      player.y = Math.max(goalTop + r, Math.min(goalBottom - r, player.y));
+    } else {
+      // Outside Left Goal
+      player.x = Math.max(-BORDER_LIMIT + r, player.x);
+      if (player.y < goalTop) {
+        player.y = Math.min(goalTop - r, player.y);
+      } else {
+        player.y = Math.max(goalBottom + r, player.y);
+      }
+    }
+  }
+  // Right boundary check
+  else if (player.x + r > FIELD_W - WALL_THICKNESS) {
+    if (player.y >= goalTop && player.y <= goalBottom) {
+      // Inside Right Goal
+      player.x = Math.min(FIELD_W + GOAL_DEPTH - r, player.x);
+      player.y = Math.max(goalTop + r, Math.min(goalBottom - r, player.y));
+    } else {
+      // Outside Right Goal
+      player.x = Math.min(FIELD_W + BORDER_LIMIT - r, player.x);
+      if (player.y < goalTop) {
+        player.y = Math.min(goalTop - r, player.y);
+      } else {
+        player.y = Math.max(goalBottom + r, player.y);
+      }
+    }
+  }
+}
+
+function resolvePlayerPostCollisions(player, goalTop, goalBottom) {
+  const posts = [
+    { x: WALL_THICKNESS, y: goalTop, radius: 6 },
+    { x: WALL_THICKNESS, y: goalBottom, radius: 6 },
+    { x: FIELD_W - WALL_THICKNESS, y: goalTop, radius: 6 },
+    { x: FIELD_W - WALL_THICKNESS, y: goalBottom, radius: 6 },
+  ];
+  posts.forEach(post => {
+    const dx = player.x - post.x;
+    const dy = player.y - post.y;
+    const dist = Math.sqrt(dx * dx + dy * dy);
+    const minDist = player.radius + post.radius;
+    if (dist < minDist && dist > 0) {
+      const nx = dx / dist;
+      const ny = dy / dist;
+      player.x = post.x + nx * minDist;
+      player.y = post.y + ny * minDist;
+      const dot = player.vx * nx + player.vy * ny;
+      if (dot < 0) {
+        player.vx -= dot * nx;
+        player.vy -= dot * ny;
+      }
+    }
+  });
 }
 
 function updatePhysics(room) {
   const now = Date.now();
   const frozen = now < room.kickoffFreezeUntil;
+  const goalTop = FIELD_H / 2 - GOAL_SIZE / 2;
+  const goalBottom = FIELD_H / 2 + GOAL_SIZE / 2;
 
   // Update game timer
   if (room.gameStartedAt) {
@@ -265,9 +359,60 @@ function updatePhysics(room) {
     return;
   }
 
+  // Update cooldowns and active states of players at 60Hz
+  room.players.forEach(p => {
+    if (p.team === 'spectator') return;
+    if (p.powerCooldown > 0) {
+      p.powerCooldown = Math.max(0, p.powerCooldown - 1 / 60);
+    }
+    if (p.powerActive) {
+      if (p.powerActiveTimer > 0) {
+        p.powerActiveTimer -= 1 / 60;
+        if (p.powerActiveTimer <= 0) {
+          p.powerActive = false;
+          p.powerCooldown = 1.0; // short cancel cooldown
+        }
+      }
+    }
+  });
+
   // 1. Process player inputs and update positions
   room.players.forEach(player => {
     if (player.team === 'spectator') return;
+
+    // Tick power activation
+    if (player.input.power && player.powerCooldown === 0 && !player.powerActive) {
+      if (player.power === 'superkick') {
+        player.powerActive = true;
+        player.powerActiveTimer = 2.0; // 2 seconds duration
+      } else if (player.power === 'dash') {
+        const dist = circleDist(player, room.ball);
+        const isLastTouched = room.ball.lastTouchedBy === player.id;
+        if (isLastTouched || dist < 350) {
+          const ballSpeed = Math.sqrt(room.ball.vx * room.ball.vx + room.ball.vy * room.ball.vy);
+          let targetX, targetY;
+          const offsetDist = player.radius + room.ball.radius + 15;
+          if (ballSpeed > 0.5) {
+            targetX = room.ball.x - (room.ball.vx / ballSpeed) * offsetDist;
+            targetY = room.ball.y - (room.ball.vy / ballSpeed) * offsetDist;
+          } else {
+            const dx = player.x - room.ball.x;
+            const dy = player.y - room.ball.y;
+            const d = Math.sqrt(dx * dx + dy * dy) || 1;
+            targetX = room.ball.x + (dx / d) * offsetDist;
+            targetY = room.ball.y + (dy / d) * offsetDist;
+          }
+          const dummy = { x: targetX, y: targetY, radius: player.radius };
+          clampPlayer(dummy, goalTop, goalBottom);
+          player.x = dummy.x;
+          player.y = dummy.y;
+          player.vx = 0;
+          player.vy = 0;
+          player.powerCooldown = 5.0;
+          broadcastToRoom(room, 'playerDash', { playerId: player.id, x: player.x, y: player.y });
+        }
+      }
+    }
 
     let ax = 0, ay = 0;
     if (player.input.up) ay -= PLAYER_SPEED;
@@ -291,9 +436,9 @@ function updatePhysics(room) {
       player.y += player.vy;
     }
 
-    // Initial clamp to field
-    player.x = Math.max(player.radius + WALL_THICKNESS, Math.min(FIELD_W - player.radius - WALL_THICKNESS, player.x));
-    player.y = Math.max(player.radius + WALL_THICKNESS, Math.min(FIELD_H - player.radius - WALL_THICKNESS, player.y));
+    // Initial clamp to field limits/goals and post collision resolution
+    clampPlayer(player, goalTop, goalBottom);
+    resolvePlayerPostCollisions(player, goalTop, goalBottom);
   });
 
   if (frozen) return;
@@ -325,8 +470,18 @@ function updatePhysics(room) {
           room.ball.vy -= speedProj * kickDirY;
         }
         
-        room.ball.vx += kickDirX * PLAYER_KICK_POWER;
-        room.ball.vy += kickDirY * PLAYER_KICK_POWER;
+        let powerMultiplier = 1.0;
+        if (player.power === 'superkick' && player.powerActive) {
+          powerMultiplier = 1.8;
+          player.powerActive = false;
+          player.powerActiveTimer = 0;
+          player.powerCooldown = 5.0;
+          room.ball.superKicked = true;
+          broadcastToRoom(room, 'playerSuperkick', { playerId: player.id });
+        }
+        
+        room.ball.vx += kickDirX * PLAYER_KICK_POWER * powerMultiplier;
+        room.ball.vy += kickDirY * PLAYER_KICK_POWER * powerMultiplier;
         room.ball.lastTouchedBy = player.id;
       }
     }
@@ -349,24 +504,25 @@ function updatePhysics(room) {
       const minDist = player.radius + room.ball.radius;
       if (dist < minDist && dist > 0) {
         resolveCircleCollisionWithMass(player, room.ball, 2.5, 0.5, 0.45);
+        if (room.ball.superKicked && room.ball.lastTouchedBy !== player.id) {
+          room.ball.superKicked = false;
+        }
         room.ball.lastTouchedBy = player.id;
       }
     });
 
-    // C. Clamp players to field boundaries
+    // C. Clamp players to field boundaries / goals and post collision resolution
     room.players.forEach(player => {
       if (player.team === 'spectator') return;
-      player.x = Math.max(player.radius + WALL_THICKNESS, Math.min(FIELD_W - player.radius - WALL_THICKNESS, player.x));
-      player.y = Math.max(player.radius + WALL_THICKNESS, Math.min(FIELD_H - player.radius - WALL_THICKNESS, player.y));
+      clampPlayer(player, goalTop, goalBottom);
+      resolvePlayerPostCollisions(player, goalTop, goalBottom);
     });
 
     // D. Resolve ball-wall and post collisions
-    resolveBallWallAndPostCollisions(room.ball);
+    resolveBallWallAndPostCollisions(room.ball, room);
   }
 
   // 5. Goal detection (runs after authoritative physics are settled)
-  const goalTop = FIELD_H / 2 - GOAL_SIZE / 2;
-  const goalBottom = FIELD_H / 2 + GOAL_SIZE / 2;
 
   if (room.ball.x < 0 && room.ball.y > goalTop && room.ball.y < goalBottom) {
     // GOAL for Blue team!
@@ -466,6 +622,9 @@ function broadcastGameState(room) {
       goals: p.goals,
       ping: p.ping || 0,
       lastProcessedSeq: p.lastProcessedSeq || 0,
+      power: p.power,
+      powerCooldown: Math.max(0, Math.round(p.powerCooldown * 10) / 10),
+      powerActive: p.powerActive,
     });
   });
 
@@ -477,6 +636,7 @@ function broadcastGameState(room) {
       vx: Math.round(room.ball.vx * 100) / 100,
       vy: Math.round(room.ball.vy * 100) / 100,
       radius: room.ball.radius,
+      superKicked: room.ball.superKicked || false,
     },
     scoreRed: room.scoreRed,
     scoreBlue: room.scoreBlue,
@@ -564,7 +724,7 @@ io.on('connection', (socket) => {
     // Join the room
     socket.join(roomId);
     currentRoom = room;
-    const player = addPlayerToRoom(room, socket.id, nickname);
+    const player = addPlayerToRoom(room, socket.id, nickname, data.power);
 
     socket.emit('roomJoined', {
       roomId: room.id,
@@ -574,6 +734,7 @@ io.on('connection', (socket) => {
       players: getPlayersInRoom(room),
       maxScore: room.maxScore,
       timeLimit: room.timeLimit,
+      gameRunning: room.gameRunning,
     });
 
     io.emit('roomList', getRoomList());
@@ -596,7 +757,7 @@ io.on('connection', (socket) => {
 
     socket.join(room.id);
     currentRoom = room;
-    const player = addPlayerToRoom(room, socket.id, nickname);
+    const player = addPlayerToRoom(room, socket.id, nickname, data.power);
 
     socket.emit('roomJoined', {
       roomId: room.id,
@@ -606,6 +767,7 @@ io.on('connection', (socket) => {
       players: getPlayersInRoom(room),
       maxScore: room.maxScore,
       timeLimit: room.timeLimit,
+      gameRunning: room.gameRunning,
     });
 
     broadcastToRoom(room, 'playerJoined', {
@@ -707,6 +869,7 @@ io.on('connection', (socket) => {
           left: !!data.keys?.left,
           right: !!data.keys?.right,
           kick: !!data.keys?.kick,
+          power: !!data.keys?.power,
         };
         player.lastProcessedSeq = data.seq;
       }
@@ -717,6 +880,7 @@ io.on('connection', (socket) => {
         left: !!data.left,
         right: !!data.right,
         kick: !!data.kick,
+        power: !!data.power,
       };
     }
   });

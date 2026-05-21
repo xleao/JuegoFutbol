@@ -36,6 +36,10 @@
           <h2>Hax<span class="accent">Fútbol</span></h2>
         </div>
         <div class="lobby-user">
+          <select id="select-power" class="power-select">
+            <option value="superkick">🔥 Supertiro</option>
+            <option value="dash">⚡ Dash</option>
+          </select>
           <span id="display-nickname" class="nickname-badge"></span>
         </div>
       </header>
@@ -124,6 +128,17 @@
         <div id="goal-banner" class="goal-banner hidden">
           <span class="goal-text">⚽ ¡GOOOL!</span>
           <span id="goal-scorer" class="goal-scorer"></span>
+        </div>
+        <!-- Power HUD floating container -->
+        <div id="power-hud" class="power-hud hidden">
+          <div class="power-hud-icon" id="power-hud-icon">🔥</div>
+          <div class="power-hud-info">
+            <span class="power-hud-name" id="power-hud-name">Supertiro</span>
+            <div class="power-hud-progress-bg">
+              <div class="power-hud-progress-bar" id="power-hud-bar"></div>
+            </div>
+            <span class="power-hud-cooldown-text" id="power-hud-cooldown-text">DISPONIBLE [Shift]</span>
+          </div>
         </div>
       </div>
 

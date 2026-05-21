@@ -18,6 +18,11 @@ const els = {
   goalBanner: $('#goal-banner'), goalScorer: $('#goal-scorer'),
   modalPassword: $('#modal-password'), modalPasswordInput: $('#modal-password-input'),
   modalCancel: $('#modal-cancel'), modalJoin: $('#modal-join'),
+  powerHud: $('#power-hud'),
+  powerHudIcon: $('#power-hud-icon'),
+  powerHudName: $('#power-hud-name'),
+  powerHudBar: $('#power-hud-bar'),
+  powerHudCooldownText: $('#power-hud-cooldown-text'),
 };
 
 let myNickname = '', myId = null, isHost = false, currentRoomId = null, gameRunning = false, pendingJoinRoomId = null;
@@ -27,12 +32,12 @@ const ballHistory = [];
 let shakeAmount = 0;
 let lastBallVx = 0;
 let lastBallVy = 0;
-const FIELD_W = 1200, FIELD_H = 600, GOAL_SIZE = 160, WALL_THICKNESS = 6, GOAL_DEPTH = 40;
+const FIELD_W = 1200, FIELD_H = 600, GOAL_SIZE = 220, WALL_THICKNESS = 6, GOAL_DEPTH = 40, BORDER_LIMIT = 40;
 
 // Physics constants (must match server)
 const PLAYER_SPEED = 0.25, FRICTION_PLAYER = 0.94, FRICTION_BALL = 0.985;
 
-const keys = { up: false, down: false, left: false, right: false, kick: false };
+const keys = { up: false, down: false, left: false, right: false, kick: false, power: false };
 const inputHistory = [];
 
 let clientInputSeq = 0;
@@ -74,6 +79,72 @@ function resizeCanvas() {
 }
 window.addEventListener('resize', resizeCanvas);
 
+function clampPlayer(player, goalTop, goalBottom) {
+  const r = player.radius || 18;
+  
+  // Clamp Y to the absolute outer boundaries
+  player.y = Math.max(-BORDER_LIMIT + r, Math.min(FIELD_H + BORDER_LIMIT - r, player.y));
+
+  // Left boundary check
+  if (player.x - r < WALL_THICKNESS) {
+    if (player.y >= goalTop && player.y <= goalBottom) {
+      // Inside Left Goal
+      player.x = Math.max(-GOAL_DEPTH + r, player.x);
+      player.y = Math.max(goalTop + r, Math.min(goalBottom - r, player.y));
+    } else {
+      // Outside Left Goal
+      player.x = Math.max(-BORDER_LIMIT + r, player.x);
+      if (player.y < goalTop) {
+        player.y = Math.min(goalTop - r, player.y);
+      } else {
+        player.y = Math.max(goalBottom + r, player.y);
+      }
+    }
+  }
+  // Right boundary check
+  else if (player.x + r > FIELD_W - WALL_THICKNESS) {
+    if (player.y >= goalTop && player.y <= goalBottom) {
+      // Inside Right Goal
+      player.x = Math.min(FIELD_W + GOAL_DEPTH - r, player.x);
+      player.y = Math.max(goalTop + r, Math.min(goalBottom - r, player.y));
+    } else {
+      // Outside Right Goal
+      player.x = Math.min(FIELD_W + BORDER_LIMIT - r, player.x);
+      if (player.y < goalTop) {
+        player.y = Math.min(goalTop - r, player.y);
+      } else {
+        player.y = Math.max(goalBottom + r, player.y);
+      }
+    }
+  }
+}
+
+function resolvePlayerPostCollisions(player, goalTop, goalBottom) {
+  const posts = [
+    { x: WALL_THICKNESS, y: goalTop, radius: 6 },
+    { x: WALL_THICKNESS, y: goalBottom, radius: 6 },
+    { x: FIELD_W - WALL_THICKNESS, y: goalTop, radius: 6 },
+    { x: FIELD_W - WALL_THICKNESS, y: goalBottom, radius: 6 },
+  ];
+  posts.forEach(post => {
+    const dx = player.x - post.x;
+    const dy = player.y - post.y;
+    const dist = Math.sqrt(dx * dx + dy * dy);
+    const minDist = player.radius + post.radius;
+    if (dist < minDist && dist > 0) {
+      const nx = dx / dist;
+      const ny = dy / dist;
+      player.x = post.x + nx * minDist;
+      player.y = post.y + ny * minDist;
+      const dot = player.vx * nx + player.vy * ny;
+      if (dot < 0) {
+        player.vx -= dot * nx;
+        player.vy -= dot * ny;
+      }
+    }
+  });
+}
+
 // ─── LOCAL PLAYER PHYSICS (runs at 60Hz fixed timestep) ──────
 function updateLocalPlayer(inputKeys = keys) {
   if (!localPlayerActive) return;
@@ -97,9 +168,11 @@ function updateLocalPlayer(inputKeys = keys) {
   localPlayer.x += localPlayer.vx;
   localPlayer.y += localPlayer.vy;
 
-  // Clamp to field
-  localPlayer.x = Math.max(localPlayer.radius + WALL_THICKNESS, Math.min(FIELD_W - localPlayer.radius - WALL_THICKNESS, localPlayer.x));
-  localPlayer.y = Math.max(localPlayer.radius + WALL_THICKNESS, Math.min(FIELD_H - localPlayer.radius - WALL_THICKNESS, localPlayer.y));
+  // Clamp to field limits/goals and post collision resolution
+  const goalTop = FIELD_H / 2 - GOAL_SIZE / 2;
+  const goalBottom = FIELD_H / 2 + GOAL_SIZE / 2;
+  clampPlayer(localPlayer, goalTop, goalBottom);
+  resolvePlayerPostCollisions(localPlayer, goalTop, goalBottom);
 }
 
 // Gently correct local player position towards server truth
@@ -317,12 +390,100 @@ function updateAndDrawParticles() {
 function updateBallTrail() {
   if (!renderBall) return;
   ballHistory.push({ x: renderBall.x, y: renderBall.y });
-  if (ballHistory.length > 8) {
+  const maxHistory = renderBall.superKicked ? 15 : 8;
+  while (ballHistory.length > maxHistory) {
     ballHistory.shift();
+  }
+
+  // If ball has superKick active, spawn fire/smoke particles
+  if (renderBall.superKicked) {
+    const speedSq = renderBall.vx * renderBall.vx + renderBall.vy * renderBall.vy;
+    const speed = Math.sqrt(speedSq || 0);
+    const count = speed > 5 ? 2 : 1;
+    for (let k = 0; k < count; k++) {
+      const angle = speed > 0.1 ? Math.atan2(-renderBall.vy, -renderBall.vx) + (Math.random() - 0.5) * 0.7 : Math.random() * Math.PI * 2;
+      const pSpeed = (0.2 + Math.random() * 0.8) * (speed * 0.35 + 1);
+      const colors = ['#ef4444', '#f97316', '#fbbf24', '#fcd34d'];
+      const randColor = colors[Math.floor(Math.random() * colors.length)];
+      particles.push({
+        x: renderBall.x + (Math.random() - 0.5) * 12,
+        y: renderBall.y + (Math.random() - 0.5) * 12,
+        vx: Math.cos(angle) * pSpeed,
+        vy: Math.sin(angle) * pSpeed,
+        color: randColor,
+        size: 2 + Math.random() * 3.5,
+        alpha: 1.0,
+        decay: 0.02 + Math.random() * 0.04,
+        gravity: 0
+      });
+    }
   }
 }
 
+function updatePlayerPowerEffects() {
+  if (!renderPlayers) return;
+  renderPlayers.forEach(p => {
+    if (p.team === 'spectator') return;
+    if (p.power === 'superkick' && p.powerActive) {
+      // Spawn fire sparks/spores around the player
+      if (Math.random() < 0.35) {
+        const angle = Math.random() * Math.PI * 2;
+        const px = p.x + Math.cos(angle) * p.radius;
+        const py = p.y + Math.sin(angle) * p.radius;
+        particles.push({
+          x: px,
+          y: py,
+          vx: Math.cos(angle) * (0.2 + Math.random() * 0.6),
+          vy: Math.sin(angle) * (0.2 + Math.random() * 0.6) - 0.25, // drift upwards slightly
+          color: Math.random() < 0.55 ? '#f97316' : '#fbbf24',
+          size: 1.5 + Math.random() * 2,
+          alpha: 1,
+          decay: 0.02 + Math.random() * 0.03,
+          gravity: 0
+        });
+      }
+    } else if (p.power === 'dash' && p.powerActive) {
+      // Spawn electric blue sparks
+      if (Math.random() < 0.25) {
+        const angle = Math.random() * Math.PI * 2;
+        const px = p.x + Math.cos(angle) * p.radius;
+        const py = p.y + Math.sin(angle) * p.radius;
+        particles.push({
+          x: px,
+          y: py,
+          vx: Math.cos(angle) * (0.1 + Math.random() * 0.4),
+          vy: Math.sin(angle) * (0.1 + Math.random() * 0.4),
+          color: '#38bdf8',
+          size: 1 + Math.random() * 2,
+          alpha: 1,
+          decay: 0.03 + Math.random() * 0.04,
+          gravity: 0
+        });
+      }
+    }
+  });
+}
+
 function drawBallTrail() {
+  if (renderBall.superKicked) {
+    // Premium fire trail drawing using radial gradients per segment
+    for (let i = 0; i < ballHistory.length; i++) {
+      const pos = ballHistory[i];
+      const alpha = (i + 1) / ballHistory.length * 0.42;
+      const radius = renderBall.radius * (0.45 + 0.85 * (i + 1) / ballHistory.length);
+      ctx.beginPath();
+      ctx.arc(pos.x, pos.y, radius, 0, Math.PI * 2);
+      const gradient = ctx.createRadialGradient(pos.x, pos.y, radius * 0.1, pos.x, pos.y, radius);
+      gradient.addColorStop(0, `rgba(253, 224, 71, ${alpha})`); // yellow center
+      gradient.addColorStop(0.4, `rgba(249, 115, 22, ${alpha * 0.85})`); // orange mid
+      gradient.addColorStop(0.8, `rgba(239, 68, 68, ${alpha * 0.4})`); // red edge
+      gradient.addColorStop(1, 'rgba(239, 68, 68, 0)');
+      ctx.fillStyle = gradient;
+      ctx.fill();
+    }
+    return;
+  }
+
   const speedSq = renderBall.vx * renderBall.vx + renderBall.vy * renderBall.vy;
   const speed = Math.sqrt(speedSq || 0);
   if (speed < 1.2) return;
@@ -364,6 +525,8 @@ function updateRenderPositions(dt) {
       renderBall.x = targetBall.x;
       renderBall.y = targetBall.y;
     }
+    renderBall.superKicked = targetBall.superKicked || false;
+
     const newRenderPlayers = [];
     targetPlayers.forEach((target, id) => {
       let rx = target.x;
@@ -379,10 +542,15 @@ function updateRenderPositions(dt) {
         radius: target.radius,
         ping: target.ping,
         x: rx,
-        y: ry
+        y: ry,
+        power: target.power,
+        powerCooldown: target.powerCooldown,
+        powerActive: target.powerActive
       });
     });
     renderPlayers = newRenderPlayers;
+    const me = newRenderPlayers.find(p => p.id === myId);
+    updateLocalPowerHUD(me);
     return;
   }
 
@@ -425,12 +593,14 @@ function updateRenderPositions(dt) {
     renderBall.vx = localBall.vx;
     renderBall.vy = localBall.vy;
     renderBall.radius = localBall.radius;
+    renderBall.superKicked = targetBall.superKicked || false;
   } else {
     renderBall.x = lerp(s0.state.ball.x, s1.state.ball.x, t);
     renderBall.y = lerp(s0.state.ball.y, s1.state.ball.y, t);
     renderBall.vx = lerp(s0.state.ball.vx || 0, s1.state.ball.vx || 0, t);
     renderBall.vy = lerp(s0.state.ball.vy || 0, s1.state.ball.vy || 0, t);
     renderBall.radius = s0.state.ball.radius || 12;
+    renderBall.superKicked = s0.state.ball.superKicked || false;
   }
 
   // 2. Interpolate Players (local uses prediction, remotes use snapshot interpolation)
@@ -453,7 +623,10 @@ function updateRenderPositions(dt) {
       radius: localTarget.radius,
       ping: localTarget.ping,
       x: rx,
-      y: ry
+      y: ry,
+      power: localTarget.power,
+      powerCooldown: localTarget.powerCooldown,
+      powerActive: localTarget.powerActive
     });
   }
 
@@ -469,7 +642,10 @@ function updateRenderPositions(dt) {
         radius: p0.radius,
         ping: p0.ping || 0,
         x: lerp(p0.x, p1.x, t),
-        y: lerp(p0.y, p1.y, t)
+        y: lerp(p0.y, p1.y, t),
+        power: p0.power,
+        powerCooldown: lerp(p0.powerCooldown || 0, p1.powerCooldown || 0, t),
+        powerActive: p0.powerActive
       });
     } else if (p0) {
       newRenderPlayers.push({
@@ -478,7 +654,10 @@ function updateRenderPositions(dt) {
         radius: p0.radius,
         ping: p0.ping || 0,
         x: p0.x,
-        y: p0.y
+        y: p0.y,
+        power: p0.power,
+        powerCooldown: p0.powerCooldown,
+        powerActive: p0.powerActive
       });
     } else if (p1) {
       newRenderPlayers.push({
@@ -487,12 +666,17 @@ function updateRenderPositions(dt) {
         radius: p1.radius,
         ping: p1.ping || 0,
         x: p1.x,
-        y: p1.y
+        y: p1.y,
+        power: p1.power,
+        powerCooldown: p1.powerCooldown,
+        powerActive: p1.powerActive
       });
     }
   });
 
   renderPlayers = newRenderPlayers;
+  const me = newRenderPlayers.find(p => p.id === myId);
+  updateLocalPowerHUD(me);
 }
 
 // ─── RENDER LOOP ─────────────────────────────────────────────
@@ -535,9 +719,11 @@ function render(timestamp) {
         // B. Colisionar jugador con el balón
         resolveCircleCollisionWithMass(localPlayer, localBall, 2.5, 0.5, 0.45);
 
-        // C. Clamp jugador local a los límites del campo
-        localPlayer.x = Math.max(localPlayer.radius + WALL_THICKNESS, Math.min(FIELD_W - localPlayer.radius - WALL_THICKNESS, localPlayer.x));
-        localPlayer.y = Math.max(localPlayer.radius + WALL_THICKNESS, Math.min(FIELD_H - localPlayer.radius - WALL_THICKNESS, localPlayer.y));
+        // C. Clamp jugador local a los límites del campo / arcos y resolver postes
+        const goalTop = FIELD_H / 2 - GOAL_SIZE / 2;
+        const goalBottom = FIELD_H / 2 + GOAL_SIZE / 2;
+        clampPlayer(localPlayer, goalTop, goalBottom);
+        resolvePlayerPostCollisions(localPlayer, goalTop, goalBottom);
 
         // D. Colisionar balón con paredes y postes
         resolveLocalBallWallCollisions(localBall);
@@ -557,8 +743,9 @@ function render(timestamp) {
   // Smoothly follow remote entities
   updateRenderPositions(dt);
   
-  // Update ball trail history
+  // Update ball trail history and player power effects
   updateBallTrail();
+  updatePlayerPowerEffects();
 
   const s = canvasScale;
   ctx.clearRect(0, 0, els.canvas.width, els.canvas.height);
@@ -630,6 +817,11 @@ function drawField() {
   const w = FIELD_W, h = FIELD_H;
   const goalTop = h / 2 - GOAL_SIZE / 2, goalBot = h / 2 + GOAL_SIZE / 2;
 
+  // Darker green grass border
+  ctx.fillStyle = '#14532d';
+  ctx.fillRect(-GOAL_DEPTH - 20, -BORDER_LIMIT - 20, w + GOAL_DEPTH * 2 + 40, h + BORDER_LIMIT * 2 + 40);
+
+  // Pitch green
   ctx.fillStyle = '#1a6b35';
   ctx.fillRect(0, 0, w, h);
   ctx.fillStyle = 'rgba(0,0,0,0.04)';
@@ -642,20 +834,34 @@ function drawField() {
   ctx.fillStyle = 'rgba(255,255,255,0.4)'; ctx.beginPath(); ctx.arc(w / 2, h / 2, 4, 0, Math.PI * 2); ctx.fill();
 
   ctx.strokeStyle = 'rgba(255,255,255,0.2)';
-  ctx.strokeRect(WALL_THICKNESS, h / 2 - 140, 120, 280);
-  ctx.strokeRect(w - WALL_THICKNESS - 120, h / 2 - 140, 120, 280);
+  ctx.strokeRect(WALL_THICKNESS, h / 2 - GOAL_SIZE / 2 - 40, 120, GOAL_SIZE + 80);
+  ctx.strokeRect(w - WALL_THICKNESS - 120, h / 2 - GOAL_SIZE / 2 - 40, 120, GOAL_SIZE + 80);
 
   // Draw detailed nets
   drawGoalNet(-GOAL_DEPTH, goalTop, GOAL_DEPTH, GOAL_SIZE, true);
   drawGoalNet(w, goalTop, GOAL_DEPTH, GOAL_SIZE, false);
 
   ctx.fillStyle = '#2d3748';
-  ctx.fillRect(-GOAL_DEPTH, -4, w + GOAL_DEPTH * 2, WALL_THICKNESS + 4);
-  ctx.fillRect(-GOAL_DEPTH, h - WALL_THICKNESS, w + GOAL_DEPTH * 2, WALL_THICKNESS + 4);
-  ctx.fillRect(-GOAL_DEPTH - 4, -4, GOAL_DEPTH + WALL_THICKNESS + 4, goalTop + 4);
-  ctx.fillRect(-GOAL_DEPTH - 4, goalBot, GOAL_DEPTH + WALL_THICKNESS + 4, h - goalBot + 4);
-  ctx.fillRect(w - WALL_THICKNESS, -4, GOAL_DEPTH + WALL_THICKNESS + 4, goalTop + 4);
-  ctx.fillRect(w - WALL_THICKNESS, goalBot, GOAL_DEPTH + WALL_THICKNESS + 4, h - goalBot + 4);
+  // Outer top and bottom walls
+  ctx.fillRect(-GOAL_DEPTH - 20, -BORDER_LIMIT - 6, w + GOAL_DEPTH * 2 + 40, 6);
+  ctx.fillRect(-GOAL_DEPTH - 20, h + BORDER_LIMIT, w + GOAL_DEPTH * 2 + 40, 6);
+
+  // Left vertical walls
+  ctx.fillRect(-BORDER_LIMIT - 6, -BORDER_LIMIT - 6, 6, BORDER_LIMIT + goalTop + 6);
+  ctx.fillRect(-BORDER_LIMIT - 6, goalBot, 6, h - goalBot + BORDER_LIMIT + 6);
+
+  // Right vertical walls
+  ctx.fillRect(w + BORDER_LIMIT, -BORDER_LIMIT - 6, 6, BORDER_LIMIT + goalTop + 6);
+  ctx.fillRect(w + BORDER_LIMIT, goalBot, 6, h - goalBot + BORDER_LIMIT + 6);
+
+  // Goal structures (backs, tops, bottoms)
+  ctx.fillRect(-GOAL_DEPTH - 6, goalTop, 6, goalBot - goalTop); // Left goal back
+  ctx.fillRect(-GOAL_DEPTH, goalTop - 3, GOAL_DEPTH + WALL_THICKNESS, 3); // Left goal top
+  ctx.fillRect(-GOAL_DEPTH, goalBot, GOAL_DEPTH + WALL_THICKNESS, 3); // Left goal bottom
+
+  ctx.fillRect(w + GOAL_DEPTH, goalTop, 6, goalBot - goalTop); // Right goal back
+  ctx.fillRect(w - WALL_THICKNESS, goalTop - 3, GOAL_DEPTH + WALL_THICKNESS, 3); // Right goal top
+  ctx.fillRect(w - WALL_THICKNESS, goalBot, GOAL_DEPTH + WALL_THICKNESS, 3); // Right goal bottom
 
   [{ x: WALL_THICKNESS, y: goalTop }, { x: WALL_THICKNESS, y: goalBot }, { x: w - WALL_THICKNESS, y: goalTop }, { x: w - WALL_THICKNESS, y: goalBot }].forEach(p => {
     ctx.beginPath(); ctx.arc(p.x, p.y, 6, 0, Math.PI * 2);
@@ -669,11 +875,30 @@ function drawBall(ball) {
   // Improved shadow
   ctx.beginPath(); ctx.arc(ball.x + 4, ball.y + 6, ball.radius, 0, Math.PI * 2); ctx.fillStyle = 'rgba(0,0,0,0.25)'; ctx.fill();
   
+  // Outer fire glow if superKicked
+  if (ball.superKicked) {
+    ctx.save();
+    const glowRadius = ball.radius + 6 + Math.sin(Date.now() / 70) * 2.5;
+    ctx.beginPath();
+    ctx.arc(ball.x, ball.y, glowRadius, 0, Math.PI * 2);
+    const glowGradient = ctx.createRadialGradient(ball.x, ball.y, ball.radius * 0.75, ball.x, ball.y, glowRadius);
+    glowGradient.addColorStop(0, 'rgba(253, 224, 71, 0.95)'); // Bright yellow center
+    glowGradient.addColorStop(0.4, 'rgba(249, 115, 22, 0.75)'); // Fiery orange mid
+    glowGradient.addColorStop(1, 'rgba(239, 68, 68, 0)'); // Transparent red outer
+    ctx.fillStyle = glowGradient;
+    ctx.fill();
+    ctx.restore();
+  }
+
   ctx.beginPath(); ctx.arc(ball.x, ball.y, ball.radius, 0, Math.PI * 2);
   const g = ctx.createRadialGradient(ball.x - 3, ball.y - 3, 1, ball.x, ball.y, ball.radius);
-  g.addColorStop(0, '#ffffff'); g.addColorStop(1, '#d1d5db'); ctx.fillStyle = g; ctx.fill();
-  ctx.strokeStyle = '#9ca3af'; ctx.lineWidth = 1.5; ctx.stroke();
-  ctx.fillStyle = 'rgba(0,0,0,0.12)'; ctx.beginPath(); ctx.arc(ball.x, ball.y, ball.radius * 0.45, 0, Math.PI * 2); ctx.fill();
+  g.addColorStop(0, ball.superKicked ? '#fef08a' : '#ffffff');
+  g.addColorStop(1, ball.superKicked ? '#ea580c' : '#d1d5db');
+  ctx.fillStyle = g; ctx.fill();
+  ctx.strokeStyle = ball.superKicked ? '#ea580c' : '#9ca3af'; ctx.lineWidth = ball.superKicked ? 2.5 : 1.5; ctx.stroke();
+  
+  ctx.fillStyle = ball.superKicked ? 'rgba(254, 240, 138, 0.35)' : 'rgba(0,0,0,0.12)';
+  ctx.beginPath(); ctx.arc(ball.x, ball.y, ball.radius * 0.45, 0, Math.PI * 2); ctx.fill();
 }
 
 function drawPlayers(players) {
@@ -688,6 +913,47 @@ function drawPlayers(players) {
     // Improved soft shadow
     ctx.beginPath(); ctx.arc(p.x + 3, p.y + 5, p.radius, 0, Math.PI * 2); ctx.fillStyle = 'rgba(0,0,0,0.22)'; ctx.fill();
     
+    // Active power glowing ring underneath player
+    if (p.powerActive) {
+      ctx.save();
+      const activeRadius = p.radius + 6 + Math.sin(Date.now() / 100) * 2.5;
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, activeRadius, 0, Math.PI * 2);
+      ctx.strokeStyle = p.power === 'superkick' ? 'rgba(249, 115, 22, 0.85)' : 'rgba(14, 165, 233, 0.85)';
+      ctx.lineWidth = 3;
+      ctx.shadowBlur = 12;
+      ctx.shadowColor = p.power === 'superkick' ? '#f97316' : '#0ea5e9';
+      ctx.stroke();
+      
+      // Secondary aura
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, activeRadius + 2.5, 0, Math.PI * 2);
+      ctx.strokeStyle = p.power === 'superkick' ? 'rgba(239, 68, 68, 0.35)' : 'rgba(59, 130, 246, 0.35)';
+      ctx.lineWidth = 1.5;
+      ctx.stroke();
+      ctx.restore();
+    }
+
+    // Cooldown indicator ring
+    if (p.powerCooldown > 0 && !p.powerActive) {
+      const cdRadius = p.radius + 5;
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, cdRadius, 0, Math.PI * 2);
+      ctx.strokeStyle = 'rgba(0,0,0,0.25)';
+      ctx.lineWidth = 3.5;
+      ctx.stroke();
+
+      const maxCd = 5.0; // max cooldown is 5s
+      const angle = (p.powerCooldown / maxCd) * Math.PI * 2;
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, cdRadius, -Math.PI / 2, -Math.PI / 2 + angle, false);
+      ctx.strokeStyle = '#ef4444';
+      ctx.lineWidth = 3.5;
+      ctx.lineCap = 'round';
+      ctx.stroke();
+    }
+
+    // Draw main player body
     ctx.beginPath(); ctx.arc(p.x, p.y, p.radius, 0, Math.PI * 2);
     const g = ctx.createRadialGradient(p.x - 4, p.y - 4, 2, p.x, p.y, p.radius);
     g.addColorStop(0, tl); g.addColorStop(1, tc); ctx.fillStyle = g; ctx.fill();
@@ -706,13 +972,13 @@ function drawPlayers(players) {
     ctx.font = `bold ${isMe ? 11 : 10}px Inter,sans-serif`;
     ctx.textAlign = 'center'; ctx.textBaseline = 'bottom';
     ctx.shadowColor = 'rgba(0,0,0,0.7)'; ctx.shadowBlur = 3;
-    ctx.fillText(nicknameStr, p.x, p.y - p.radius - 5);
+    ctx.fillText(nicknameStr, p.x, p.y - p.radius - 6);
     ctx.shadowBlur = 0;
   });
 }
 
 // ─── INPUT ───────────────────────────────────────────────────
-const keyMap = { ArrowUp: 'up', w: 'up', W: 'up', ArrowDown: 'down', s: 'down', S: 'down', ArrowLeft: 'left', a: 'left', A: 'left', ArrowRight: 'right', d: 'right', D: 'right', ' ': 'kick', x: 'kick', X: 'kick' };
+const keyMap = { ArrowUp: 'up', w: 'up', W: 'up', ArrowDown: 'down', s: 'down', S: 'down', ArrowLeft: 'left', a: 'left', A: 'left', ArrowRight: 'right', d: 'right', D: 'right', ' ': 'kick', x: 'kick', X: 'kick', Shift: 'power', q: 'power', Q: 'power', e: 'power', E: 'power' };
 
 document.addEventListener('keydown', e => {
   if (e.target.tagName === 'INPUT') return;
@@ -731,7 +997,11 @@ els.btnEnter.addEventListener('click', enterLobby);
 els.inputNickname.addEventListener('keydown', e => { if (e.key === 'Enter') enterLobby(); });
 function enterLobby() { const n = els.inputNickname.value.trim(); if (!n) { els.inputNickname.style.borderColor = '#ef4444'; return; } myNickname = n; socket.emit('setNickname', n); els.displayNickname.textContent = n; showScreen('lobby'); socket.emit('getRooms'); }
 
-els.btnCreateRoom.addEventListener('click', () => { socket.emit('createRoom', { name: els.createName.value.trim() || 'Sala de ' + myNickname, password: els.createPassword.value.trim(), maxPlayers: parseInt(els.createMax.value) || 10 }); });
+els.btnCreateRoom.addEventListener('click', () => {
+  const pwr = $('#select-power') ? $('#select-power').value : 'superkick';
+  console.log(`[CLIENT DEBUG] btnCreateRoom: selected power value = "${pwr}"`);
+  socket.emit('createRoom', { name: els.createName.value.trim() || 'Sala de ' + myNickname, password: els.createPassword.value.trim(), maxPlayers: parseInt(els.createMax.value) || 10, power: pwr });
+});
 els.btnRefresh.addEventListener('click', () => socket.emit('getRooms'));
 
 socket.on('roomList', rooms => {
@@ -740,9 +1010,27 @@ socket.on('roomList', rooms => {
   els.roomList.querySelectorAll('.btn-join-room').forEach(b => b.addEventListener('click', e => { e.stopPropagation(); joinRoom(b.dataset.rid, b.dataset.pw === 'true'); }));
 });
 
-function joinRoom(rid, hasPw) { if (hasPw) { pendingJoinRoomId = rid; els.modalPassword.classList.remove('hidden'); els.modalPasswordInput.value = ''; els.modalPasswordInput.focus(); } else { socket.emit('joinRoom', { roomId: rid, password: '' }); } }
+function joinRoom(rid, hasPw) {
+  const pwr = $('#select-power') ? $('#select-power').value : 'superkick';
+  console.log(`[CLIENT DEBUG] joinRoom: selected power value = "${pwr}"`);
+  if (hasPw) {
+    pendingJoinRoomId = rid;
+    els.modalPassword.classList.remove('hidden');
+    els.modalPasswordInput.value = '';
+    els.modalPasswordInput.focus();
+  } else {
+    socket.emit('joinRoom', { roomId: rid, password: '', power: pwr });
+  }
+}
 els.modalCancel.addEventListener('click', () => { els.modalPassword.classList.add('hidden'); pendingJoinRoomId = null; });
-els.modalJoin.addEventListener('click', () => { if (pendingJoinRoomId) { socket.emit('joinRoom', { roomId: pendingJoinRoomId, password: els.modalPasswordInput.value }); els.modalPassword.classList.add('hidden'); pendingJoinRoomId = null; } });
+els.modalJoin.addEventListener('click', () => {
+  if (pendingJoinRoomId) {
+    const pwr = $('#select-power') ? $('#select-power').value : 'superkick';
+    socket.emit('joinRoom', { roomId: pendingJoinRoomId, password: els.modalPasswordInput.value, power: pwr });
+    els.modalPassword.classList.add('hidden');
+    pendingJoinRoomId = null;
+  }
+});
 els.modalPasswordInput.addEventListener('keydown', e => { if (e.key === 'Enter') els.modalJoin.click(); });
 socket.on('joinError', msg => alert(msg));
 
@@ -753,7 +1041,7 @@ socket.on('roomJoined', data => {
   currentRoomId = data.roomId; isHost = data.isHost;
   els.roomNameDisplay.textContent = data.roomName;
   els.settingMaxScore.value = data.maxScore || 5; els.settingTimeLimit.value = data.timeLimit || 180;
-  gameRunning = false; hasReceivedFirstState = false; targetPlayers.clear(); renderPlayers = []; localPlayerActive = false;
+  gameRunning = !!data.gameRunning; hasReceivedFirstState = false; targetPlayers.clear(); renderPlayers = []; localPlayerActive = false;
   localPlayerPrev.x = 0; localPlayerPrev.y = 0;
   inputHistory.length = 0;
   snapshotQueue.length = 0;
@@ -766,7 +1054,11 @@ socket.on('roomJoined', data => {
   ballVisualOffset.x = 0; ballVisualOffset.y = 0;
   els.chatLog.innerHTML = ''; els.scoreRed.textContent = '0'; els.scoreBlue.textContent = '0'; els.timerDisplay.textContent = '0:00';
   updateHostUI(); updatePlayerLists(data.players); showScreen('game');
-  showOverlay('Esperando jugadores...\n\nWASD / Flechas = moverse\nESPACIO / X = patear');
+  if (gameRunning) {
+    hideOverlay();
+  } else {
+    showOverlay('Esperando jugadores...\n\nWASD / Flechas = moverse\nESPACIO / X = patear');
+  }
 });
 
 socket.on('playerJoined', d => updatePlayerLists(d.players));
@@ -809,6 +1101,76 @@ socket.on('goalScored', d => {
   shakeAmount = 18;
 });
 
+socket.on('playerSuperkick', data => {
+  const p = targetPlayers.get(data.playerId);
+  if (p) {
+    spawnParticles(p.x, p.y, '#f97316', 15, 4, [2, 4], [0.02, 0.05]);
+    spawnParticles(p.x, p.y, '#fbbf24', 10, 3, [1.5, 3.5], [0.03, 0.06]);
+  }
+  shakeAmount = Math.min(shakeAmount + 12, 20);
+});
+
+socket.on('playerDash', data => {
+  spawnParticles(data.x, data.y, '#0ea5e9', 15, 3.5, [2, 4], [0.03, 0.06]);
+  spawnParticles(data.x, data.y, '#38bdf8', 10, 2.5, [1.5, 3.5], [0.04, 0.08]);
+  shakeAmount = Math.min(shakeAmount + 4, 8);
+});
+
+socket.on('superkickImpact', data => {
+  spawnParticles(data.x, data.y, '#ef4444', 25, 6, [3, 5], [0.015, 0.04]);
+  spawnParticles(data.x, data.y, '#f97316', 15, 4.5, [2, 4], [0.02, 0.05]);
+  spawnParticles(data.x, data.y, '#fcd34d', 10, 3, [1.5, 3], [0.03, 0.06]);
+  shakeAmount = Math.min(shakeAmount + 24, 30);
+});
+
+function updateLocalPowerHUD(player) {
+  if (player) {
+    console.log(`[CLIENT DEBUG] updateLocalPowerHUD: player.power = "${player.power}", cooldown = ${player.powerCooldown}, active = ${player.powerActive}`);
+  }
+  if (!player || player.team === 'spectator' || !gameRunning) {
+    if (els.powerHud) els.powerHud.classList.add('hidden');
+    return;
+  }
+
+  if (els.powerHud) els.powerHud.classList.remove('hidden');
+
+  const pName = player.power === 'superkick' ? 'Supertiro' : 'Dash';
+  const pIcon = player.power === 'superkick' ? '🔥' : '⚡';
+
+  if (els.powerHudName) els.powerHudName.textContent = pName;
+  if (els.powerHudIcon) els.powerHudIcon.textContent = pIcon;
+
+  if (player.powerActive) {
+    if (els.powerHud) els.powerHud.classList.add('active-glowing');
+    if (els.powerHudBar) {
+      els.powerHudBar.style.width = '100%';
+      els.powerHudBar.style.background = player.power === 'superkick' ? 'linear-gradient(90deg, #f97316, #ef4444)' : 'linear-gradient(90deg, #0ea5e9, #3b82f6)';
+    }
+    if (els.powerHudCooldownText) {
+      els.powerHudCooldownText.textContent = player.power === 'superkick' ? '¡SÚPER TIRO CARGADO!' : '¡TELETRANSPORTE!';
+    }
+  } else if (player.powerCooldown > 0) {
+    if (els.powerHud) els.powerHud.classList.remove('active-glowing');
+    const cdPercent = Math.max(0, Math.min(100, (1 - player.powerCooldown / 5.0) * 100));
+    if (els.powerHudBar) {
+      els.powerHudBar.style.width = `${cdPercent}%`;
+      els.powerHudBar.style.background = '#ef4444';
+    }
+    if (els.powerHudCooldownText) {
+      els.powerHudCooldownText.textContent = `ESPERA: ${player.powerCooldown.toFixed(1)}s`;
+    }
+  } else {
+    if (els.powerHud) els.powerHud.classList.remove('active-glowing');
+    if (els.powerHudBar) {
+      els.powerHudBar.style.width = '100%';
+      els.powerHudBar.style.background = '#10b981';
+    }
+    if (els.powerHudCooldownText) {
+      els.powerHudCooldownText.textContent = 'DISPONIBLE [Shift]';
+    }
+  }
+}
+
 // ─── SERVER SNAPSHOTS (20Hz) ─────────────────────────────────
 socket.on('gameState', state => {
   hasReceivedFirstState = true;
@@ -827,6 +1189,7 @@ socket.on('gameState', state => {
   targetBall.y = state.ball.y;
   targetBall.vx = state.ball.vx;
   targetBall.vy = state.ball.vy;
+  targetBall.superKicked = state.ball.superKicked || false;
   
   // Clean up targetPlayers not in the new snapshot
   const currentIds = new Set(state.players.map(p => p.id));
@@ -845,7 +1208,10 @@ socket.on('gameState', state => {
       vy: p.vy,
       team: p.team,
       radius: p.radius,
-      ping: p.ping || 0
+      ping: p.ping || 0,
+      power: p.power,
+      powerCooldown: p.powerCooldown,
+      powerActive: p.powerActive
     });
   });
 
@@ -950,8 +1316,10 @@ socket.on('gameState', state => {
         for (let iter = 0; iter < 3; iter++) {
           resolvePlayerPlayerCollisions();
           resolveCircleCollisionWithMass(localPlayer, localBall, 2.5, 0.5, 0.45);
-          localPlayer.x = Math.max(localPlayer.radius + WALL_THICKNESS, Math.min(FIELD_W - localPlayer.radius - WALL_THICKNESS, localPlayer.x));
-          localPlayer.y = Math.max(localPlayer.radius + WALL_THICKNESS, Math.min(FIELD_H - localPlayer.radius - WALL_THICKNESS, localPlayer.y));
+          const goalTop = FIELD_H / 2 - GOAL_SIZE / 2;
+          const goalBottom = FIELD_H / 2 + GOAL_SIZE / 2;
+          clampPlayer(localPlayer, goalTop, goalBottom);
+          resolvePlayerPostCollisions(localPlayer, goalTop, goalBottom);
           resolveLocalBallWallCollisions(localBall);
         }
         handleLocalKick(item.keys);

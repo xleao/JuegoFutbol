@@ -742,3 +742,103 @@ body {
   .form-row { flex-direction: column; }
   .form-group.small { flex: unset; }
 }
+
+/* ─── POWER SELECTOR & HUD (LOBBY & IN-GAME) ────────────────── */
+.power-select {
+  background: rgba(15, 23, 42, 0.65);
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+  color: #f8fafc;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 8px;
+  padding: 0.35rem 0.75rem;
+  font-size: 0.85rem;
+  font-weight: 600;
+  outline: none;
+  cursor: pointer;
+  transition: all 0.2s ease;
+  margin-right: 0.75rem;
+  font-family: var(--font);
+}
+.power-select:hover {
+  background: rgba(15, 23, 42, 0.85);
+  border-color: var(--accent);
+  box-shadow: 0 0 10px rgba(34, 211, 238, 0.2);
+}
+.power-select:focus {
+  border-color: var(--accent);
+  box-shadow: 0 0 12px rgba(34, 211, 238, 0.35);
+}
+
+.power-hud {
+  position: absolute;
+  bottom: 20px;
+  right: 20px;
+  width: 220px;
+  background: rgba(15, 23, 42, 0.75);
+  backdrop-filter: blur(10px);
+  -webkit-backdrop-filter: blur(10px);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 12px;
+  padding: 0.75rem 1rem;
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  z-index: 10;
+  box-shadow: 0 8px 32px 0 rgba(0, 0, 0, 0.37);
+  transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+  pointer-events: none;
+}
+.power-hud.hidden {
+  display: none !important;
+}
+.power-hud-icon {
+  font-size: 1.8rem;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(255, 255, 255, 0.05);
+  border-radius: 8px;
+  width: 44px;
+  height: 44px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+}
+.power-hud-info {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+  flex: 1;
+}
+.power-hud-name {
+  font-weight: 700;
+  font-size: 0.9rem;
+  color: #f8fafc;
+  font-family: var(--font);
+}
+.power-hud-progress-bg {
+  width: 100%;
+  height: 6px;
+  background: rgba(255, 255, 255, 0.1);
+  border-radius: 3px;
+  overflow: hidden;
+}
+.power-hud-progress-bar {
+  height: 100%;
+  width: 100%;
+  background: #10b981;
+  border-radius: 3px;
+  transition: width 0.1s linear, background-color 0.2s;
+}
+.power-hud-cooldown-text {
+  font-size: 0.75rem;
+  font-weight: 600;
+  color: #94a3b8;
+  letter-spacing: 0.05em;
+  font-family: var(--font);
+}
+
+/* Glowing active state */
+.power-hud.active-glowing {
+  border-color: rgba(245, 158, 11, 0.6);
+  box-shadow: 0 0 15px rgba(245, 158, 11, 0.3), 0 8px 32px 0 rgba(0, 0, 0, 0.37);
+}
